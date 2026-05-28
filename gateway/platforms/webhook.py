@@ -11,12 +11,19 @@ Each route defines:
   - secret: HMAC secret for signature validation (REQUIRED)
   - prompt: template string formatted with the webhook payload
   - skills: optional list of skills to load for the agent
-  - deliver: where to send the response (github_comment, telegram, etc.)
-  - deliver_extra: additional delivery config (repo, pr_number, chat_id)
+  - deliver: where to send the response (github_comment, telegram, exec, etc.)
+  - deliver_extra: additional delivery config (repo, pr_number, chat_id,
+    or for `exec`: cmd, timeout, stdin)
   - deliver_only: if true, skip the agent — the rendered prompt IS the
     message that gets delivered.  Use for external push notifications
     (Supabase, monitoring alerts, inter-agent pings) where zero LLM cost
     and sub-second delivery matter more than agent reasoning.
+
+The `exec` deliver target shells out to an external binary, piping the
+rendered prompt to its stdin.  Mirrors `github_comment`'s subprocess
+shape: bounded timeout, captured stdout/stderr, argv-list only (no
+shell interpolation).  Useful for deterministic routing/dispatch where
+the LLM's reasoning isn't needed.
 
 Security:
   - HMAC secret is required per route (validated at startup)
@@ -107,6 +114,12 @@ _BUILTIN_DELIVER_PLATFORMS = {
     "feishu", "wecom", "wecom_callback", "weixin", "bluebubbles",
     "qqbot", "yuanbao",
 }
+
+# Default timeout for `deliver: exec` subprocess invocations.  Keep this
+# tight — the webhook adapter returns 202 to the source synchronously
+# only after delivery completes.  Long-running handlers should defer
+# work via a queue, not block the adapter.
+_DEFAULT_EXEC_TIMEOUT = 10
 
 # Default bind host. ``None`` tells aiohttp/asyncio's ``create_server`` to bind
 # BOTH address families (IPv4 + IPv6) — the portable dual-stack default.
@@ -381,6 +394,9 @@ class WebhookAdapter(BasePlatformAdapter):
 
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
+
+        if deliver_type == "exec":
+            return await self._deliver_exec(content, delivery)
 
         # Cross-platform delivery — any platform with a gateway adapter.
         # Check both built-in names and plugin-registered platforms.
@@ -1274,10 +1290,111 @@ class WebhookAdapter(BasePlatformAdapter):
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
 
+        if deliver_type == "exec":
+            return await self._deliver_exec(content, delivery)
+
         # Fall through to the cross-platform dispatcher, which validates the
         # target name and routes via the gateway runner.
         return await self._deliver_cross_platform(
             deliver_type, content, delivery
+        )
+
+    async def _deliver_exec(
+        self, content: str, delivery: dict
+    ) -> SendResult:
+        """Pipe *content* into an external command's stdin and capture exit.
+
+        Lets a webhook route dispatch a deterministic shell handler
+        without spawning an agent session.  Mirrors the ``github_comment``
+        target's subprocess shape: bounded timeout, captured stdout/stderr,
+        no shell interpolation (argv list only).
+
+        ``deliver_extra`` schema:
+          - ``cmd`` (required): list[str] of argv. First element is the
+            binary path; remaining are arguments. Shell metacharacters
+            are NOT interpreted — pass them as literal argv entries.
+          - ``timeout`` (optional, default 10s): seconds before the
+            subprocess is killed.  Aim for sub-5s handlers in practice;
+            anything longer should defer work via a queue rather than
+            block the adapter.
+          - ``stdin`` (optional, default true): when truthy, ``content``
+            is piped to the subprocess's stdin.  Set falsy to skip and
+            just pass the rendered prompt via argv if your handler
+            prefers that.
+
+        Returns SendResult(success=True) on exit 0.  Returns
+        success=False with stderr on non-zero exit, FileNotFoundError
+        (binary missing), or timeout.  Never raises.
+        """
+        extra = delivery.get("deliver_extra", {})
+        cmd = extra.get("cmd")
+        if not cmd or not isinstance(cmd, list):
+            logger.error(
+                "[webhook] exec delivery missing cmd (list of argv strings)"
+            )
+            return SendResult(
+                success=False, error="exec delivery missing cmd argv list"
+            )
+        # Defend against accidental shell-string injection — argv must
+        # be all strings; reject anything else loudly rather than letting
+        # subprocess.run coerce silently.
+        if not all(isinstance(a, str) for a in cmd):
+            logger.error(
+                "[webhook] exec delivery cmd must be a list of strings; "
+                "got %r",
+                [type(a).__name__ for a in cmd],
+            )
+            return SendResult(
+                success=False,
+                error="exec delivery cmd contains non-string entries",
+            )
+
+        timeout = float(extra.get("timeout", _DEFAULT_EXEC_TIMEOUT))
+        send_stdin = bool(extra.get("stdin", True))
+
+        try:
+            result = subprocess.run(
+                cmd,
+                input=content if send_stdin else None,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except FileNotFoundError:
+            logger.error(
+                "[webhook] exec delivery binary not found: %s", cmd[0]
+            )
+            return SendResult(
+                success=False, error=f"binary not found: {cmd[0]}"
+            )
+        except subprocess.TimeoutExpired:
+            logger.error(
+                "[webhook] exec delivery timed out after %.1fs: %s",
+                timeout, cmd[0],
+            )
+            return SendResult(
+                success=False,
+                error=f"exec timed out after {timeout:.1f}s",
+            )
+        except Exception as e:
+            logger.error("[webhook] exec delivery error: %s", e)
+            return SendResult(success=False, error=str(e))
+
+        if result.returncode == 0:
+            logger.info(
+                "[webhook] exec delivery succeeded: %s (stdout=%d bytes)",
+                cmd[0], len(result.stdout or ""),
+            )
+            return SendResult(success=True)
+
+        logger.error(
+            "[webhook] exec delivery exit=%d: %s — %s",
+            result.returncode, cmd[0],
+            (result.stderr or "")[:500],
+        )
+        return SendResult(
+            success=False,
+            error=f"exit {result.returncode}: {(result.stderr or '')[:200]}",
         )
 
     async def _deliver_github_comment(
