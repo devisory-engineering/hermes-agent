@@ -337,3 +337,121 @@ class TestGitHubCommentDelivery:
         # Delivery info is retained after send() so interim status messages
         # don't strand the final response (TTL-based cleanup happens on POST).
         assert chat_id in adapter._delivery_info
+
+
+# ===================================================================
+# Test 5: Exec delivery (subprocess shell-out, deliver_only mode)
+# ===================================================================
+
+class TestExecDelivery:
+    """``deliver: exec`` shells out to an external binary with the rendered
+    prompt piped to stdin. Use for deterministic dispatch/routing where
+    the LLM's reasoning is not needed."""
+
+    @pytest.mark.asyncio
+    async def test_exec_delivery_pipes_content_to_stdin(self):
+        adapter = _make_adapter({})
+        delivery = {
+            "deliver": "exec",
+            "deliver_extra": {"cmd": ["/usr/bin/cat"], "timeout": 5},
+        }
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "hello bob"
+        mock_result.stderr = ""
+
+        with patch(
+            "gateway.platforms.webhook.subprocess.run",
+            return_value=mock_result,
+        ) as mock_run:
+            result = await adapter._deliver_exec("hello bob", delivery)
+
+        assert result.success is True
+        mock_run.assert_called_once_with(
+            ["/usr/bin/cat"],
+            input="hello bob",
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_exec_delivery_missing_cmd_fails_closed(self):
+        adapter = _make_adapter({})
+        result = await adapter._deliver_exec("body", {"deliver_extra": {}})
+        assert result.success is False
+        assert "missing cmd" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_exec_delivery_rejects_non_string_argv(self):
+        adapter = _make_adapter({})
+        result = await adapter._deliver_exec(
+            "body",
+            {"deliver_extra": {"cmd": ["/usr/bin/cat", 42, {"k": "v"}]}},
+        )
+        assert result.success is False
+        assert "non-string" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_exec_delivery_binary_not_found(self):
+        adapter = _make_adapter({})
+        result = await adapter._deliver_exec(
+            "body",
+            {"deliver_extra": {"cmd": ["/no/such/binary"]}},
+        )
+        assert result.success is False
+        assert "not found" in (result.error or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_exec_delivery_timeout(self):
+        import subprocess as _sp
+        adapter = _make_adapter({})
+        with patch(
+            "gateway.platforms.webhook.subprocess.run",
+            side_effect=_sp.TimeoutExpired(cmd=["/usr/bin/sleep"], timeout=0.1),
+        ):
+            result = await adapter._deliver_exec(
+                "body",
+                {"deliver_extra": {"cmd": ["/usr/bin/sleep", "5"], "timeout": 0.1}},
+            )
+        assert result.success is False
+        assert "timed out" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_exec_delivery_nonzero_exit(self):
+        adapter = _make_adapter({})
+        mock_result = MagicMock()
+        mock_result.returncode = 2
+        mock_result.stdout = ""
+        mock_result.stderr = "bad input"
+
+        with patch(
+            "gateway.platforms.webhook.subprocess.run",
+            return_value=mock_result,
+        ):
+            result = await adapter._deliver_exec(
+                "body",
+                {"deliver_extra": {"cmd": ["/usr/bin/false"]}},
+            )
+        assert result.success is False
+        assert "exit 2" in (result.error or "")
+        assert "bad input" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_exec_delivery_stdin_disabled(self):
+        adapter = _make_adapter({})
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = ""
+        mock_result.stderr = ""
+
+        with patch(
+            "gateway.platforms.webhook.subprocess.run",
+            return_value=mock_result,
+        ) as mock_run:
+            await adapter._deliver_exec(
+                "body that should not reach stdin",
+                {"deliver_extra": {"cmd": ["/usr/bin/true"], "stdin": False}},
+            )
+        # input kwarg should be None when stdin is disabled
+        assert mock_run.call_args.kwargs["input"] is None
