@@ -848,6 +848,15 @@ class DockerEnvironment(BaseEnvironment):
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
+        # Snap/cwd artifacts must land on a container-writable path. The
+        # container runs as a non-root user (image 'agent' or host hermes)
+        # while /tmp tmpfs mounts root:root 755 -> unwritable. Honor the
+        # configured TMPDIR (docker_env, e.g. the disk-backed /scratch) so the
+        # snap-script wrapper + cwd marker don't fail 'Permission denied' on /tmp.
+        _td = (self._env.get("TMPDIR") or "").rstrip("/")
+        if _td:
+            self._snapshot_path = f"{_td}/hermes-snap-{self._session_id}.sh"
+            self._cwd_file = f"{_td}/hermes-cwd-{self._session_id}.txt"
         self._container_id: Optional[str] = None
         self._labels: dict[str, str] = {}
         self._image: str = ""
