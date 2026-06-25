@@ -26,6 +26,7 @@ Design:
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 from contextlib import contextmanager
@@ -731,6 +732,35 @@ class MemoryStore:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 
 
+_MEMORY_PII_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")  # email = likely customer/personal data
+
+
+def _memory_write_needs_review(target: str,
+                               content: Optional[str],
+                               old_text: Optional[str]) -> bool:
+    """Classify a memory write for *tiered* write-approval.
+
+    Returns True when the write belongs to a sensitive class that must still go
+    through the human approval gate; False for operational/factual memory that
+    may be applied inline.
+
+    Sensitive (gated):
+      * user-profile writes (``target == "user"``) — identity / preferences.
+      * any memory carrying customer/personal data (an email address).
+
+    Everything else is operational/factual (repo paths, API quirks, command
+    syntax, internal operating notes) and applies inline, which keeps the
+    agent's native at-limit consolidation in the loop instead of deferring
+    writes to an un-consolidated pending queue.
+    """
+    if target == "user":
+        return True
+    text = (content or "") + " " + (old_text or "")
+    if _MEMORY_PII_RE.search(text):
+        return True
+    return False
+
+
 def _apply_write_gate(action: str, target: str, content: Optional[str],
                       old_text: Optional[str]) -> Optional[str]:
     """Evaluate the memory write gate. Returns a JSON tool-result string when
@@ -741,6 +771,17 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
     """
     if action not in {"add", "replace", "remove"}:
         return None
+
+    # Tiered gate (opt-in via ``memory.write_approval_tiered``): operational
+    # memory applies inline; only the sensitive classes reach the approval gate.
+    try:
+        from tools import write_approval as _wa_tier
+        if (_wa_tier.memory_write_tiered_enabled()
+                and not _memory_write_needs_review(target, content, old_text)):
+            return None
+    except Exception:
+        # Fail open to the existing (untiered) gate behaviour on any error.
+        pass
 
     try:
         from tools import write_approval as wa

@@ -89,6 +89,28 @@ def write_approval_enabled(subsystem: str) -> bool:
     return _normalize_enabled(raw)
 
 
+TIERED_KEY = "write_approval_tiered"
+
+
+def memory_write_tiered_enabled() -> bool:
+    """Return whether *tiered* memory write-approval is enabled.
+
+    When ``memory.write_approval_tiered`` is true, operational/factual memory
+    writes bypass the approval gate (applied inline, which preserves the agent's
+    native at-limit consolidation) while only the sensitive classes — user-profile
+    writes (identity/preferences) and any memory carrying customer/personal data —
+    remain gated. Defaults to ``False`` (no tiering; existing behaviour preserved
+    until the operator opts in).
+    """
+    try:
+        from hermes_cli.config import load_config, cfg_get
+        cfg = load_config()
+        raw = cfg_get(cfg, MEMORY, TIERED_KEY, default=False)
+    except Exception:
+        return False
+    return _normalize_enabled(raw)
+
+
 def _normalize_enabled(value: Any) -> bool:
     """Coerce a config value to a bool. Default (unknown) is False (gate off).
 
