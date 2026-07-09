@@ -6599,6 +6599,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         msg = f"⚠️ Gateway {action} — {hint}"
 
         notified: set[tuple[str, str, Optional[str]]] = set()
+        home_only_shutdown_targets = False
         for session_key in active:
             source = None
             try:
@@ -6651,6 +6652,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     continue
 
+                if platform == Platform.SLACK and is_truthy_value(
+                    os.getenv("SLACK_GATEWAY_LIFECYCLE_HOME_ONLY", "")
+                ):
+                    home = self.config.get_home_channel(platform)
+                    if home and home.chat_id:
+                        home_only_shutdown_targets = True
+                        logger.info(
+                            "Shutdown notification for active Slack session %s:%s routed to home channel only",
+                            platform_str,
+                            chat_id,
+                        )
+                        continue
+
                 reply_to_message_id = getattr(source, "message_id", None) if source is not None else None
                 if reply_to_message_id is None and restart_source is not None:
                     try:
@@ -6692,7 +6706,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform_str, chat_id, e,
                 )
 
-        if self._restart_requested and restart_source is not None:
+        if self._restart_requested and restart_source is not None and not home_only_shutdown_targets:
             logger.debug("Skipping home-channel shutdown notifications for in-chat restart")
             return
 
