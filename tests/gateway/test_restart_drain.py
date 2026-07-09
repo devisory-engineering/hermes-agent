@@ -305,6 +305,50 @@ async def test_windows_detached_restart_watcher_keeps_console_python(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_slack_lifecycle_home_only_routes_active_session_to_home(monkeypatch):
+    """Slack lifecycle pings can be routed to the control/home channel only."""
+    from gateway.config import HomeChannel, Platform, PlatformConfig
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms = {
+        Platform.SLACK: PlatformConfig(
+            enabled=True,
+            token="***",
+            home_channel=HomeChannel(
+                platform=Platform.SLACK,
+                chat_id="control-room",
+                name="eng-control-room",
+            ),
+        )
+    }
+    runner.adapters = {Platform.SLACK: adapter}
+
+    source = make_restart_source(chat_id="work-channel", chat_type="channel")
+    source.platform = Platform.SLACK
+    session_key = build_session_key(source)
+    runner._running_agents[session_key] = MagicMock()
+    runner.session_store._entries = {
+        session_key: SessionEntry(
+            session_key=session_key,
+            session_id="sess-1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=source.platform,
+            chat_type=source.chat_type,
+        )
+    }
+    monkeypatch.setenv("SLACK_GATEWAY_LIFECYCLE_HOME_ONLY", "true")
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    sent_chat_ids = {chat_id for chat_id, _content, _meta in adapter.sent_calls}
+    assert sent_chat_ids == {"control-room"}
+    assert len(adapter.sent) == 1
+    assert "shutting down" in adapter.sent[0]
+
+
+@pytest.mark.asyncio
 async def test_shutdown_notification_uses_persisted_origin_for_colon_ids():
     """Shutdown notifications should route from persisted origin, not reparsed keys."""
     runner, adapter = make_restart_runner()
