@@ -75,6 +75,25 @@ def list_session_providers() -> List[DashboardAuthProvider]:
         return [p for p in _providers.values() if getattr(p, "supports_session", True)]
 
 
+def list_session_token_providers() -> List[DashboardAuthProvider]:
+    """Registered providers whose token authenticates the FULL gated surface.
+
+    The subset of ``list_providers()`` whose ``supports_session_token`` flag is
+    True, in registration order. ``gated_auth_middleware`` consults ONLY these
+    when honouring a header-carried token as a cookie-session stand-in (the
+    Hermes Desktop remote-pairing path). Deliberately narrower than
+    ``list_token_providers()``: a per-route service credential (drain) has
+    ``supports_token`` but NOT ``supports_session_token``, so its secret can
+    never unlock the whole dashboard. Empty list ⇒ no header-token stand-in is
+    accepted and the gate falls through to cookie auth / 401 (fails closed).
+    """
+    with _lock:
+        return [
+            p for p in _providers.values()
+            if getattr(p, "supports_session_token", False)
+        ]
+
+
 def clear_providers() -> None:
     """Test-only: drop all registrations."""
     with _lock:

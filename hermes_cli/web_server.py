@@ -20189,6 +20189,17 @@ def start_server(
                     )
             except Exception:
                 pass
+            try:
+                import sys as _sys
+
+                _dr = _sys.modules.get("hermes_plugins.cv_dashboard_desktop_remote")
+                _dr_reason = getattr(_dr, "LAST_SKIP_REASON", "")
+                if _dr_reason:
+                    skip_reasons.append(
+                        f"  • desktop-remote: {_dr_reason}"
+                    )
+            except Exception:
+                pass
 
             _fix_hint = (
                 "Configure an auth provider before exposing the dashboard:\n"
