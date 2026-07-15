@@ -1976,51 +1976,69 @@ def _assert_fs_path_allowed(resolved: Path) -> None:
     if _under(own_home, resolved):
         return
 
-    # Supplementary hard denylist: the hermes user's host credential/secret
-    # stores, even OUTSIDE .hermes. Resolve $HOME at runtime; compare on the
-    # already-resolved path so ``..``/symlink escapes are covered.
+    # Resolve the hermes user's $HOME at runtime; compare on the already-resolved
+    # (symlink/.. collapsed) path so escapes are covered.
     try:
-        _user_home = Path.home()
+        user_home = Path.home().resolve(strict=False)
     except Exception:
-        _user_home = hermes_root.parent if hermes_root is not None else None
-    if _user_home is not None:
-        _secret_stores = (
-            _user_home / ".ssh",
-            _user_home / ".aws",
-            _user_home / ".config" / "gh",
-            _user_home / ".config" / "gcloud",
-            _user_home / ".config" / "git",
-            _user_home / ".gnupg",
-            _user_home / ".kube",
-            _user_home / ".docker" / "config.json",
-            _user_home / ".netrc",
-            _user_home / ".git-credentials",
+        user_home = (
+            hermes_root.parent
+            if hermes_root is not None
+            else (own_home.parent.parent if own_home is not None else None)
         )
-        for _store in _secret_stores:
+
+    # Redundant hard denylist (belt-and-suspenders on top of the deny-by-default
+    # below; also the sole guard for the rare case where $HOME cannot be
+    # resolved but a well-known store path is passed).
+    if user_home is not None:
+        for _store in (
+            user_home / ".ssh",
+            user_home / ".aws",
+            user_home / ".config" / "gh",
+            user_home / ".config" / "gcloud",
+            user_home / ".config" / "git",
+            user_home / ".gnupg",
+            user_home / ".kube",
+            user_home / ".docker" / "config.json",
+            user_home / ".netrc",
+            user_home / ".git-credentials",
+            user_home / ".gitconfig",
+            user_home / ".claude",
+        ):
             if _under(_store, resolved):
                 raise HTTPException(
                     status_code=403,
                     detail="This dashboard is scoped to a single profile.",
                 )
 
-    # If we could not even establish our own home, fail closed on the whole
-    # hermes tree (better a false 403 than a cross-profile read).
+    # Fail closed if we could not establish our own home: deny the whole hermes
+    # $HOME and state root (better a false 403 than a cross-profile read).
     if own_home is None:
-        deny_root = hermes_root or Path("/home/hermes/.hermes")
-        if _under(deny_root, resolved):
-            raise HTTPException(
-                status_code=403,
-                detail="This dashboard is scoped to a single profile.",
-            )
+        for _deny in (user_home, hermes_root, Path("/home/hermes")):
+            if _deny is not None and _under(_deny, resolved):
+                raise HTTPException(
+                    status_code=403,
+                    detail="This dashboard is scoped to a single profile.",
+                )
         return
-    # Anything under the hermes state root but outside our own home is a
-    # sibling profile / shared / machine-cred path -> refuse.
-    if _under(hermes_root, resolved):
+
+    # Deny-by-default across the hermes user's $HOME. Everything under $HOME that
+    # is NOT our own profile home (allowed above) is refused: the dotfiles /
+    # secret stores (~/.ssh, ~/.gitconfig, ~/.claude, ~/.config/*, ~/.local/*),
+    # sibling profiles/<other>, shared/, and the machine dashboard creds — the
+    # whole home tree. An enumerated secret denylist is insufficient: every new
+    # tool's dotfile (~/.claude/.credentials.json, ~/.config/doppler, ~/.npmrc,
+    # ~/.terraform.d, ~/.pypirc, …) would otherwise be a fresh exfil path. The
+    # coding-rail repo working roots live OUTSIDE $HOME (e.g. /opt/...), so they
+    # stay allowed; only $HOME is deny-by-default. The hermes state root is also
+    # denied explicitly in case it is ever configured outside $HOME.
+    if _under(user_home, resolved) or _under(hermes_root, resolved):
         raise HTTPException(
             status_code=403,
             detail="This dashboard is scoped to a single profile.",
         )
-    # Outside the hermes tree entirely (repo working roots) -> permitted.
+    # Outside $HOME and the hermes state root entirely (repo working roots such
+    # as /opt/..., plus OS-permission-bounded system paths) -> permitted.
 
 
 def _fs_path(raw_path: str) -> Path:
@@ -2497,11 +2515,20 @@ async def list_managed_files(request: Request, path: Optional[str] = None):
         raise HTTPException(status_code=400, detail="Path is not a directory")
 
     try:
-        entries = [
-            _managed_file_entry(policy, child)
-            for child in target.iterdir()
-            if not _is_sensitive_path(child)
-        ]
+        entries = []
+        for child in target.iterdir():
+            if _is_sensitive_path(child):
+                continue
+            try:
+                entries.append(_managed_file_entry(policy, child))
+            except HTTPException as exc:
+                # Under --isolated, a child outside this profile's allowed scope
+                # (sibling profile, host dotfile, symlink escape) is 403'd by
+                # _assert_fs_path_allowed. Skip it rather than aborting the whole
+                # listing (mirrors how /api/fs/list degrades on a denied child).
+                if exc.status_code == 403:
+                    continue
+                raise
     except PermissionError:
         raise HTTPException(status_code=403, detail="Directory is not readable")
     except OSError as exc:
