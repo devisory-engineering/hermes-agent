@@ -453,6 +453,13 @@ def _require_token(request: Request) -> None:
         # authenticated. Belt-and-braces: confirm the session is present.
         if getattr(request.state, "session", None) is not None:
             return
+        # A headless desktop-remote client authenticates via the session-token
+        # provider (gated_auth_middleware sets token_authenticated, not a cookie
+        # session). Honour it here too — otherwise every _require_token op
+        # (plugin install/enable/disable, …) 401s for the Desktop app. Mirrors
+        # auth_middleware and the plugins gate, which already accept it.
+        if getattr(request.state, "token_authenticated", False):
+            return
         raise HTTPException(status_code=401, detail="Unauthorized")
     if not _has_valid_session_token(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
