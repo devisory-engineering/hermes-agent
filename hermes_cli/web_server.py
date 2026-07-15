@@ -1909,6 +1909,113 @@ _FS_MIME_TYPES = {
 }
 
 
+def _assert_fs_path_allowed(resolved: Path) -> None:
+    """Deny-by-default filesystem containment for an --isolated dashboard.
+
+    ``_fs_path`` is the single chokepoint for EVERY file-browser (``/api/fs/*``)
+    and git (``/api/git/*`` via ``_git_path``) route, and those routes take a
+    client-supplied ABSOLUTE path — they never flow through the ``?profile=``
+    resolver that ``_assert_profile_allowed`` guards. So a valid per-profile
+    desktop-remote token would otherwise let an owner read/write ANY file the
+    hermes user can touch, including sibling profiles' ``.env`` / ``secrets/`` /
+    ``state.db`` and the shared credential blob. This is the second isolation
+    door; gate it here.
+
+    Rule (only when isolated): the resolved, symlink-collapsed path must be
+    EITHER under this instance's own ``$HERMES_HOME`` (``.hermes/profiles/<self>``)
+    OR entirely OUTSIDE the hermes state root (``.hermes``) — the latter is the
+    coding-rail's repo working roots, which legitimately live elsewhere. Any
+    path that is under the hermes root but NOT under our own home — i.e. every
+    sibling ``profiles/<other>``, ``shared/``, the machine ``dashboard*`` creds,
+    and the top-level config/credentials — is refused. Applies to read AND
+    write, fs AND git, because every access resolves through here first.
+
+    Supplementary hard denylist: the hermes USER's host credential/secret stores
+    (``~/.ssh``, ``~/.aws``, …) sit OUTSIDE ``.hermes`` and would otherwise be
+    permitted by the "outside the hermes tree" allowance — but copying an SSH key
+    or AWS creds out of one isolated dashboard is full lateral movement that
+    defeats the isolation. Those are hard-denied even outside ``.hermes``. This
+    is ON TOP OF the own-home allowlist, not a replacement, so real repo roots
+    (``/opt/...`` etc.) keep working.
+
+    No-op when not isolated (the all-profiles machine dashboard is unchanged).
+    """
+    iso = _isolated_profile()
+    if not iso:
+        return
+    from hermes_constants import get_hermes_home, get_default_hermes_root
+
+    def _under(base: Optional[Path], p: Path) -> bool:
+        if base is None:
+            return False
+        try:
+            p.relative_to(base)
+            return True
+        except ValueError:
+            return False
+
+    try:
+        own_home = Path(get_hermes_home()).resolve(strict=False)
+    except Exception:
+        own_home = None
+    try:
+        hermes_root = Path(get_default_hermes_root()).resolve(strict=False)
+    except Exception:
+        # Fall back to the parent-of-profiles derived from our own home, else
+        # the well-known layout — never leave the sensitive tree ungated.
+        hermes_root = own_home.parent.parent if own_home is not None else None
+
+    # Our own home is always allowed (no host-credential store lives under it).
+    if _under(own_home, resolved):
+        return
+
+    # Supplementary hard denylist: the hermes user's host credential/secret
+    # stores, even OUTSIDE .hermes. Resolve $HOME at runtime; compare on the
+    # already-resolved path so ``..``/symlink escapes are covered.
+    try:
+        _user_home = Path.home()
+    except Exception:
+        _user_home = hermes_root.parent if hermes_root is not None else None
+    if _user_home is not None:
+        _secret_stores = (
+            _user_home / ".ssh",
+            _user_home / ".aws",
+            _user_home / ".config" / "gh",
+            _user_home / ".config" / "gcloud",
+            _user_home / ".config" / "git",
+            _user_home / ".gnupg",
+            _user_home / ".kube",
+            _user_home / ".docker" / "config.json",
+            _user_home / ".netrc",
+            _user_home / ".git-credentials",
+        )
+        for _store in _secret_stores:
+            if _under(_store, resolved):
+                raise HTTPException(
+                    status_code=403,
+                    detail="This dashboard is scoped to a single profile.",
+                )
+
+    # If we could not even establish our own home, fail closed on the whole
+    # hermes tree (better a false 403 than a cross-profile read).
+    if own_home is None:
+        deny_root = hermes_root or Path("/home/hermes/.hermes")
+        if _under(deny_root, resolved):
+            raise HTTPException(
+                status_code=403,
+                detail="This dashboard is scoped to a single profile.",
+            )
+        return
+    # Anything under the hermes state root but outside our own home is a
+    # sibling profile / shared / machine-cred path -> refuse.
+    if _under(hermes_root, resolved):
+        raise HTTPException(
+            status_code=403,
+            detail="This dashboard is scoped to a single profile.",
+        )
+    # Outside the hermes tree entirely (repo working roots) -> permitted.
+
+
 def _fs_path(raw_path: str) -> Path:
     raw = str(raw_path or "").strip()
     if not raw:
@@ -1924,9 +2031,14 @@ def _fs_path(raw_path: str) -> Path:
         candidate = Path(raw).expanduser()
         if not candidate.is_absolute():
             candidate = Path.cwd() / candidate
-        return candidate.resolve(strict=False)
+        resolved = candidate.resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
         raise HTTPException(status_code=400, detail="Invalid path")
+    # Enforce --isolated containment on the fully-resolved (symlink/.. collapsed)
+    # path, so a sibling-profile or shared-secret path can't be reached via the
+    # file-browser / git rails. No-op for the machine dashboard.
+    _assert_fs_path_allowed(resolved)
+    return resolved
 
 
 def _fs_mime_type(path: Path) -> str:
@@ -4953,6 +5065,14 @@ def get_profiles_sessions(
             targets = []
         if not targets:
             targets.append(("default", profiles_mod.get_profile_dir("default")))
+        # In --isolated mode, never aggregate sibling profiles' sessions: keep
+        # only this instance's own profile (or resolve it directly if the scan
+        # above didn't surface it).
+        _iso = _isolated_profile()
+        if _iso:
+            targets = [(n, h) for (n, h) in targets if n == _iso] or [
+                (_iso, profiles_mod.get_profile_dir(_iso))
+            ]
 
     min_message_count = max(0, min_messages)
     archived_only = archived == "only"
@@ -12154,10 +12274,11 @@ def _cron_profile_dicts() -> List[Dict[str, Any]]:
     """Return dashboard profile records, falling back to a directory scan."""
     from hermes_cli import profiles as profiles_mod
     try:
-        return [_profile_to_dict(p) for p in profiles_mod.list_profiles()]
+        return _filter_isolated_profile_records(
+            [_profile_to_dict(p) for p in profiles_mod.list_profiles()])
     except Exception:
         _log.exception("Failed to list profiles for cron dashboard; falling back to directory scan")
-        return _fallback_profile_dicts(profiles_mod)
+        return _filter_isolated_profile_records(_fallback_profile_dicts(profiles_mod))
 
 
 def _cron_default_profile() -> str:
@@ -12190,6 +12311,10 @@ def _cron_profile_home(profile: Optional[str]) -> Tuple[str, Path]:
         profiles_mod.validate_profile_name(canon)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # This helper reimplements name validation instead of going through
+    # _resolve_profile_dir, so apply the --isolated gate here too or cron
+    # endpoints would be a cross-profile bypass.
+    _assert_profile_allowed(canon)
     if not profiles_mod.profile_exists(canon):
         raise HTTPException(status_code=404, detail=f"Profile '{canon}' does not exist.")
     return canon, profiles_mod.get_profile_dir(canon)
@@ -14926,9 +15051,61 @@ def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
     return profiles
 
 
+def _isolated_profile() -> str:
+    """The profile this server is locked to, or "" for the machine dashboard."""
+    return getattr(app.state, "isolated_profile", "") or ""
+
+
+def _assert_profile_allowed(name: str) -> None:
+    """Refuse any profile except this instance's own when running --isolated.
+
+    A dashboard launched with ``serve --isolated`` for profile X answers ONLY
+    for X. A request naming any OTHER profile (via ``?profile=`` or a JSON
+    body ``profile`` field) is refused with 403, so an owner paired to one
+    profile's backend can never pivot to a sibling's config / secrets /
+    sessions. No-op when not isolated (the machine dashboard), so all-profiles
+    management is unchanged.
+
+    This is the single named-profile chokepoint: it is called from
+    ``_resolve_profile_dir`` (which ``_profile_scope`` / ``_config_profile_scope``
+    and nearly every profile-scoped endpoint route through) and from the one
+    endpoint that re-implements name validation directly (``_cron_profile_home``).
+    ``None`` / ``""`` / ``"current"`` never reach here — those resolve to the
+    instance's own HERMES_HOME without a named lookup.
+    """
+    iso = _isolated_profile()
+    if not iso:
+        return
+    from hermes_cli import profiles as profiles_mod
+    try:
+        requested = profiles_mod.normalize_profile_name(name)
+    except Exception:
+        requested = (name or "").strip()
+    if requested and requested != iso:
+        raise HTTPException(
+            status_code=403,
+            detail="This dashboard is scoped to a single profile.",
+        )
+
+
+def _filter_isolated_profile_records(records):
+    """Trim an all-profiles enumeration to just this instance's profile.
+
+    Enumeration endpoints (``GET /api/profiles``, the cron profile dropdown)
+    scan the machine-global profiles root, which would otherwise disclose the
+    NAMES + metadata of sibling profiles to an isolated owner. When isolated,
+    keep only the record whose ``name`` matches; otherwise pass through.
+    """
+    iso = _isolated_profile()
+    if not iso:
+        return records
+    return [r for r in records if (r or {}).get("name") == iso]
+
+
 def _resolve_profile_dir(name: str) -> Path:
     """Validate ``name`` and resolve to its directory or raise an HTTPException."""
     from hermes_cli import profiles as profiles_mod
+    _assert_profile_allowed(name)
     try:
         profiles_mod.validate_profile_name(name)
     except ValueError as e:
@@ -15054,10 +15231,12 @@ async def list_profiles_endpoint():
     try:
         loop = asyncio.get_running_loop()
         profiles = await loop.run_in_executor(None, profiles_mod.list_profiles)
-        return {"profiles": [_profile_to_dict(p) for p in profiles]}
+        return {"profiles": _filter_isolated_profile_records(
+            [_profile_to_dict(p) for p in profiles])}
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")
-        return {"profiles": _fallback_profile_dicts(profiles_mod)}
+        return {"profiles": _filter_isolated_profile_records(
+            _fallback_profile_dicts(profiles_mod))}
 
 
 @app.post("/api/profiles")
@@ -19914,6 +20093,7 @@ def start_server(
     headless: bool = False,
     ssh_session_token: Optional[str] = None,
     ssh_owner_nonce: Optional[str] = None,
+    isolated_profile: str = "",
 ):
     """Start the web UI server.
 
@@ -19921,6 +20101,15 @@ def start_server(
     URL as ``?profile=<name>`` so the SPA's profile switcher preselects it
     — used when a profile alias (``<profile> dashboard``) routes to the
     machine dashboard.
+
+    ``isolated_profile`` (when set) locks this server instance to a SINGLE
+    named profile: it is stored on ``app.state.isolated_profile`` and every
+    named-profile resolution / enumeration path refuses any OTHER profile
+    with 403 (see ``_assert_profile_allowed``). This is what makes
+    ``serve --isolated`` a real access-control boundary — without it, a
+    per-request ``?profile=<other>`` would resolve a sibling profile's dir
+    from the machine-global profiles root. Empty string = the all-profiles
+    machine dashboard (unchanged behaviour).
 
     ``headless`` is the ``serve`` path: the JSON-RPC/WS backend with no UI
     build and no SPA mount (mount_spa() honours ``HERMES_SERVE_HEADLESS``), so
@@ -19946,6 +20135,24 @@ def start_server(
     # uses this to decide whether to refuse the bind, log the gate-on
     # banner, and enable uvicorn proxy_headers.
     app.state.auth_required = should_require_auth(host)
+
+    # Lock this instance to a single profile when launched with --isolated.
+    # Stored here (not just on the CLI) so the request-path resolver /
+    # enumeration gates can enforce it. "" = all-profiles machine dashboard.
+    from hermes_cli import profiles as _profiles_mod
+    try:
+        app.state.isolated_profile = (
+            _profiles_mod.normalize_profile_name(isolated_profile)
+            if isolated_profile else ""
+        )
+    except Exception:
+        app.state.isolated_profile = (isolated_profile or "").strip()
+    if app.state.isolated_profile:
+        _log.info(
+            "Dashboard is ISOLATED to profile %r — requests naming any other "
+            "profile will be refused with 403.",
+            app.state.isolated_profile,
+        )
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
     # the hermes-0day MCP-persistence campaign abused unauthenticated public
