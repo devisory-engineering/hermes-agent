@@ -184,6 +184,22 @@ class DashboardAuthProvider(ABC):
     # supports_token.
     supports_session: bool = True
 
+    # When True, a token from this provider (presented in the
+    # ``X-Hermes-Session-Token`` — or legacy ``Authorization: Bearer`` — header)
+    # authenticates a FULL interactive-surface request under
+    # ``gated_auth_middleware``, i.e. it is a headless-client credential that
+    # stands in for a cookie session across every non-public route. This is the
+    # Hermes Desktop remote-pairing model: the Desktop app has no browser cookie
+    # jar, it carries a single per-backend token on every request.
+    #
+    # STRICTLY narrower than ``supports_token`` (the per-route seam that only
+    # unlocks routes explicitly opted in, e.g. the drain endpoint). A
+    # service-credential provider like ``drain`` leaves this False so its secret
+    # can NEVER unlock the whole dashboard — only a provider that deliberately
+    # opts in (the desktop-remote provider) sets it. Token verification still
+    # goes through ``verify_token`` with a constant-time compare.
+    supports_session_token: bool = False
+
     @abstractmethod
     def start_login(self, *, redirect_uri: str) -> LoginStart: ...
 
