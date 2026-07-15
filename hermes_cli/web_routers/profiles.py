@@ -44,6 +44,8 @@ router = APIRouter()
 _cron_profile_home = late("_cron_profile_home")
 _disable_unselected_skills = late("_disable_unselected_skills")
 _fallback_profile_dicts = late("_fallback_profile_dicts")
+_filter_isolated_profile_records = late("_filter_isolated_profile_records")
+_isolated_profile = late("_isolated_profile")
 _hub_action_name = late("_hub_action_name")
 _profile_setup_command = late("_profile_setup_command")
 _profile_to_dict = late("_profile_to_dict")
@@ -106,6 +108,14 @@ def get_profiles_sessions(
             targets = []
         if not targets:
             targets.append(("default", profiles_mod.get_profile_dir("default")))
+        # In --isolated mode, never aggregate sibling profiles' sessions: keep
+        # only this instance's own profile (or resolve it directly if the scan
+        # above didn't surface it).
+        _iso = _isolated_profile()
+        if _iso:
+            targets = [(n, h) for (n, h) in targets if n == _iso] or [
+                (_iso, profiles_mod.get_profile_dir(_iso))
+            ]
 
     min_message_count = max(0, min_messages)
     archived_only = archived == "only"
@@ -237,6 +247,14 @@ def get_profiles_sessions_sidebar(
         targets = []
     if not targets:
         targets.append(("default", profiles_mod.get_profile_dir("default")))
+    # In --isolated mode, never aggregate sibling profiles' sessions: keep
+    # only this instance's own profile (same trim as /api/profiles/sessions —
+    # this batched sibling predates the gate and had the same fan-out).
+    _iso = _isolated_profile()
+    if _iso:
+        targets = [(n, h) for (n, h) in targets if n == _iso] or [
+            (_iso, profiles_mod.get_profile_dir(_iso))
+        ]
 
     recents_scope = (recents_profile or "all").strip() or "all"
     recents_exclude_list = [s for s in (recents_exclude or "").split(",") if s.strip()]
@@ -344,10 +362,12 @@ async def list_profiles_endpoint():
     try:
         loop = asyncio.get_running_loop()
         profiles = await loop.run_in_executor(None, profiles_mod.list_profiles)
-        return {"profiles": [_profile_to_dict(p) for p in profiles]}
+        return {"profiles": _filter_isolated_profile_records(
+            [_profile_to_dict(p) for p in profiles])}
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")
-        return {"profiles": _fallback_profile_dicts(profiles_mod)}
+        return {"profiles": _filter_isolated_profile_records(
+            _fallback_profile_dicts(profiles_mod))}
 
 
 @router.post("/api/profiles")

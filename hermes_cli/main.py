@@ -10470,6 +10470,17 @@ def cmd_dashboard(args):
     # The in-browser Chat tab (the embedded TUI over PTY/WebSocket) is always
     # available — the desktop app and the dashboard's own Chat tab both rely on
     # the `/api/ws` + `/api/pty` sockets, so there is no reason to gate them.
+    # When launched with --isolated for a NAMED profile, lock the server to
+    # that profile so a per-request ?profile=<other> cannot reach a sibling's
+    # data (start_server stores this on app.state and the resolver enforces
+    # 403). The reroute block above already exempted --isolated, so reaching
+    # here with a named _launch_profile means an isolated per-profile backend.
+    _isolated_profile = (
+        _launch_profile
+        if getattr(args, "isolated", False)
+        and _launch_profile not in ("default", "custom")
+        else ""
+    )
     start_server(
         host=args.host,
         port=args.port,
@@ -10479,6 +10490,7 @@ def cmd_dashboard(args):
         headless=_headless_backend,
         ssh_session_token=_ssh_session_token,
         ssh_owner_nonce=_ssh_owner_nonce,
+        isolated_profile=_isolated_profile,
     )
 
 
