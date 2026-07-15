@@ -2325,6 +2325,18 @@ def _resolve_managed_path(
     if root is not None and not _path_is_under(root, resolved):
         raise HTTPException(status_code=403, detail="Path outside managed files root")
 
+    # --isolated containment. The managed-files browser (/api/files/*) is a
+    # SECOND file-browser family that resolves client paths through here, NOT
+    # through _fs_path — so it never reached _assert_fs_path_allowed. When
+    # isolated and neither HERMES_DASHBOARD_FILES_ROOT nor the /opt/data hosted
+    # layout forces a locked_root, _managed_files_policy falls through to
+    # locked_root=None (home browse), so the check above is skipped and a
+    # per-profile token could reach ~/.ssh, a sibling profiles/<other>/state.db,
+    # ~/.docker/config.json, etc. Gate the resolved (symlink/.. collapsed) path
+    # through the same chokepoint the fs/git rails use — read AND write
+    # (for_write resolves the target too). No-op for the machine dashboard.
+    _assert_fs_path_allowed(resolved)
+
     return policy, resolved, str(resolved)
 
 
@@ -2344,6 +2356,11 @@ def _managed_file_entry(policy: ManagedFilesPolicy, target: Path) -> Dict[str, A
         raise HTTPException(status_code=400, detail="Invalid path")
     if policy.locked_root is not None and not _path_is_under(policy.locked_root, resolved):
         raise HTTPException(status_code=403, detail="Path outside managed files root")
+    # Directory listings resolve each child here; a child symlink pointing at a
+    # sibling profile or a host secret store would otherwise leak its metadata
+    # (and seed a subsequent /api/files/read) when locked_root is None under
+    # isolation. Apply the same containment as the resolve/fs chokepoints.
+    _assert_fs_path_allowed(resolved)
 
     try:
         st = resolved.stat()
@@ -14094,6 +14111,12 @@ async def run_backup(body: BackupRequest):
     args = ["backup"]
     archive: Optional[Path] = None
     output = (body.output or "").strip()
+    if output and _isolated_profile():
+        # An --isolated dashboard must not choose an arbitrary -o destination:
+        # `hermes backup -o <path>` is an unconstrained host-write primitive
+        # (clobber a sibling profile file, drop a dotfile). Ignore the client
+        # path and write to this profile's own managed backup dir instead.
+        output = ""
     if output:
         args.extend(["-o", output])
     else:
@@ -14157,6 +14180,19 @@ async def run_import(body: ImportRequest):
     archive = (body.archive or "").strip()
     if not archive:
         raise HTTPException(status_code=400, detail="archive path is required")
+    if _isolated_profile():
+        # Contain the archive path on an --isolated dashboard: without this,
+        # the os.path.isfile(archive) probe below is an arbitrary-host-path
+        # existence oracle and `hermes import <archive>` would ingest an
+        # attacker-chosen file from a sibling profile / outside the profile.
+        # Gate it through the same chokepoint the fs/git rails use (403 on
+        # sibling/secret paths) before any filesystem probe.
+        try:
+            resolved_archive = Path(archive).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid archive path")
+        _assert_fs_path_allowed(resolved_archive)
+        archive = str(resolved_archive)
     if not os.path.isfile(archive):
         raise HTTPException(status_code=404, detail=f"Archive not found: {archive}")
     args = ["import", archive]

@@ -14292,12 +14292,16 @@ def cmd_dashboard(args):
     # data (start_server stores this on app.state and the resolver enforces
     # 403). The reroute block above already exempted --isolated, so reaching
     # here with a named _launch_profile means an isolated per-profile backend.
-    _isolated_profile = (
-        _launch_profile
-        if getattr(args, "isolated", False)
-        and _launch_profile not in ("default", "custom")
-        else ""
-    )
+    # 'default'/'custom' are the machine/unscoped dashboards and cannot be
+    # isolated to a single profile. SILENTLY degrading a requested --isolated to
+    # an unrestricted all-profiles server is a footgun (the operator asked for
+    # isolation and got none, with no 403s on any door). Fail closed instead.
+    if getattr(args, "isolated", False) and _launch_profile in ("default", "custom"):
+        raise SystemExit(
+            "serve --isolated requires a named profile; refusing to start an "
+            f"unrestricted dashboard for --isolated {_launch_profile!r}"
+        )
+    _isolated_profile = _launch_profile if getattr(args, "isolated", False) else ""
     start_server(
         host=args.host,
         port=args.port,
