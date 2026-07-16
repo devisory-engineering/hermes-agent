@@ -15432,6 +15432,17 @@ async def get_active_profile_endpoint():
     the running dashboard/gateway is scoped to (derived from HERMES_HOME).
     """
     from hermes_cli import profiles as profiles_mod
+    iso = _isolated_profile()
+    if iso:
+        # An --isolated dashboard is locked to exactly one profile. The sticky
+        # active_profile marker is machine-global (it lives under the shared
+        # HERMES_HOME), so it reads whatever the machine default is — typically
+        # "default". Reporting that as ``active`` misleads the frontend into
+        # managing "default": it shows an empty skill list and sends
+        # ``?profile=default`` on every call, which this isolated server then
+        # 403s ("scoped to a single profile"). Report the locked profile for
+        # both fields so the UI manages the one profile this server serves.
+        return {"active": iso, "current": iso}
     try:
         active = profiles_mod.get_active_profile() or "default"
     except Exception:
