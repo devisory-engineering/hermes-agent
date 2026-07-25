@@ -94,6 +94,64 @@ def _ws_upgrade_authorized(ws: "WebSocket") -> bool:
     return bool(_ws._ws_auth_ok(ws))
 
 
+# ---------------------------------------------------------------------------
+# Owner-dashboard model gating (patch 0017) — per-task model/provider override
+# ---------------------------------------------------------------------------
+# Upstream ``c1b0f6f3c`` added a per-task ``model_override`` / ``provider_override``
+# column (kanban_db ``_migrate_add_optional_columns``) plus a board dropdown that
+# reads and writes it through these routes. On an --isolated (per-owner)
+# dashboard that is a NEW model-identity surface: the read leaks which model a
+# card runs on, and the write is a model-selection write — both of which 0017
+# refuses everywhere else. The kanban board itself is a legitimate isolated-
+# dashboard surface, so it cannot be denied wholesale by
+# ``_isolated_provider_config_gate``; gate the two override fields instead —
+# scrub them out of every task read, refuse them on every task write.
+# ---------------------------------------------------------------------------
+
+#: Task fields that carry model identity. Scrubbed from every serialized task.
+_MODEL_OVERRIDE_TASK_KEYS = ("model_override", "provider_override")
+
+
+def _model_control_hidden() -> bool:
+    """True when this dashboard must hide/refuse model selection + identity.
+
+    Delegates to the core dashboard's gate (``web_server._model_control_hidden``)
+    rather than re-reading ``app.state.isolated_profile`` here, so the plugin can
+    never drift from the core policy. Mirrors ``_ws_upgrade_authorized`` above:
+    with no dashboard context (a unit test importing this router standalone)
+    there is no isolated profile and nothing to hide, so report False.
+    """
+    try:
+        from hermes_cli import web_server as _ws
+
+        return bool(_ws._model_control_hidden())
+    except Exception:
+        return False
+
+
+def _assert_no_model_override(payload: Any) -> None:
+    """403 when an isolated dashboard tries to pin/clear a per-task model.
+
+    Covers create, patch, and bulk — every route whose body carries the
+    override fields. ``clear_model_override`` is refused too: clearing leaks
+    nothing, but it is still a model-selection write, and 0017's rule is that
+    model choice is a platform decision on an isolated dashboard, not an owner
+    one. The message matches ``_assert_model_control_allowed`` so the SPA shows
+    one consistent notice.
+    """
+    if not _model_control_hidden():
+        return
+    if (
+        getattr(payload, "model_override", None) is not None
+        or getattr(payload, "provider_override", None) is not None
+        or getattr(payload, "clear_model_override", False)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Model selection is managed by the platform.",
+        )
+
+
 def _resolve_board(board: Optional[str]) -> Optional[str]:
     """Validate and normalise a board slug from a query param.
 
@@ -161,6 +219,14 @@ def _task_dict(
     latest_summary: Optional[str] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
+    # Model identity never reaches an isolated (per-owner) dashboard — see
+    # _MODEL_OVERRIDE_TASK_KEYS. Every task read on this plugin funnels through
+    # here (list, detail, create, patch, bulk), so scrubbing once covers them
+    # all; the board's model dropdown then renders "unset" instead of naming
+    # the pinned model/provider.
+    if _model_control_hidden():
+        for _key in _MODEL_OVERRIDE_TASK_KEYS:
+            d.pop(_key, None)
     # Add derived age metrics so the UI can colour stale cards without
     # computing deltas client-side.
     try:
@@ -614,6 +680,7 @@ class CreateTaskBody(BaseModel):
 
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
+    _assert_no_model_override(payload)
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -830,6 +897,7 @@ class UpdateTaskBody(BaseModel):
 
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
+    _assert_no_model_override(payload)
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -1195,6 +1263,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
     This is an *independent* iteration — per-task failures don't abort
     siblings. Returns per-id outcome so the UI can surface partials.
     """
+    _assert_no_model_override(payload)
     ids = [i for i in (payload.ids or []) if i]
     if not ids:
         raise HTTPException(status_code=400, detail="ids is required")
