@@ -1506,6 +1506,28 @@ def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
     agent._cached_system_prompt = sp
 
 
+def _model_identity_hidden() -> bool:
+    """True when user-facing text must not name a model or provider.
+
+    Reads ``guardrails.model_identity_deflect`` — the operator-declared switch
+    that already turns on deterministic deflection of "what model are you /
+    who trained you / are you GPT" probes. A deployment that has decided its
+    users must not learn the backing model has decided it for ALL user-facing
+    text, not just for direct probes; an automatic failover notice is the same
+    disclosure arriving unprompted.
+
+    Absent/unreadable config → False, so this is a no-op on a default install
+    and a config-load failure can never break the failover path itself.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        guardrails = (load_config() or {}).get("guardrails") or {}
+        return bool(guardrails.get("model_identity_deflect"))
+    except Exception:
+        return False
+
+
 def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
     return (
         str(fb.get("provider") or "").strip().lower(),
@@ -1917,9 +1939,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # answering, so "what model are you?" doesn't report the primary.
         rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
+        # Both notices below are USER-FACING: _buffer_status is flushed into
+        # the active chat surface (Slack thread, CLI, dashboard) and
+        # _pending_fallback_notice is posted verbatim on the success path. When
+        # model-identity deflection is on, naming the model/provider here hands
+        # a Slack user the exact answer the deflection guardrail refuses to give
+        # when they ask "what model are you?" — a failover is a routine event, so
+        # this leaked on ordinary rate limits with no probing at all. Generalize
+        # the user-visible text; the operator-facing detail is unchanged in
+        # ``logger`` below, which goes to the host journal, not to chat.
+        _hide_identity = _model_identity_hidden()
         agent._buffer_status(
-            f"🔄 Primary model failed — switching to fallback: "
-            f"{fb_model} via {fb_provider}"
+            "🔄 Primary model unavailable — failing over"
+            if _hide_identity
+            else (
+                f"🔄 Primary model failed — switching to fallback: "
+                f"{fb_model} via {fb_provider}"
+            )
         )
         # The buffered line above is dropped on successful recovery, but a
         # provider/model switch is a durable state change operators must see
@@ -1928,8 +1964,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # (see run_agent.py); it is discarded on terminal failure since the
         # buffered line is flushed instead.  See fallback-observability fix.
         agent._pending_fallback_notice = (
-            f"🔄 Switched to fallback model: {old_model} via {old_provider} "
-            f"→ {fb_model} via {fb_provider}"
+            "🔄 Failed over to a fallback model"
+            if _hide_identity
+            else (
+                f"🔄 Switched to fallback model: {old_model} via {old_provider} "
+                f"→ {fb_model} via {fb_provider}"
+            )
         )
         logger.info(
             "Fallback activated: %s → %s (%s)",
