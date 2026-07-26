@@ -406,6 +406,36 @@ hermes_cli = ["observability/schemas/*.json"]
 # topic-setup image disappears. Loaded via Path(__file__).parent / "assets"
 # in gateway/status_phrases.py and gateway/run.py.
 gateway = ["assets/**/*"]
+# Bundled plugin manifests. `packages.find` above already ships every
+# plugins/ package's Python code, but a wheel carries only the non-Python
+# files declared here — so without this glob the built venv gets
+# plugins/observability/langfuse/__init__.py and no plugin.yaml.
+#
+# hermes_cli/plugins.py:get_bundled_plugins_dir() resolves the bundled root
+# to <site-packages>/plugins when HERMES_BUNDLED_PLUGINS is unset, and
+# _scan_level() registers a plugin only if it finds a plugin.yaml/plugin.yml
+# manifest there. No manifests means the scan finds ZERO bundled plugins:
+# `hermes plugins list` shows only user plugins, `hermes plugins enable
+# langfuse` reports "Plugin 'langfuse' is not installed or bundled", and a
+# plugin left in plugins.enabled from a previous release silently never
+# loads. Observability is the case that bit us — traces stop with no error
+# anywhere — but this applies to every bundled plugin equally.
+#
+# This entry was present through 0.18.2 and dropped in 0.19.0 along with the
+# [tool.setuptools.data-files] block, when setup.py began refusing non-Nix
+# wheel builds on the grounds that bundled assets are "resolved at runtime
+# via env-var overrides set by the nix wrapper". That holds for the Nix
+# path, which sets HERMES_BUNDLED_PLUGINS at the source tree; it does not
+# hold for a wheel-built sealed venv, which has no such wrapper and falls
+# back to the packaged directory.
+plugins = [
+  "*/dashboard/manifest.json",
+  "*/dashboard/dist/*",
+  "*/dashboard/dist/**/*",
+  "**/plugin.yaml",
+  "**/plugin.yml",
+  "**/README.md",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
