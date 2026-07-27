@@ -747,6 +747,64 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         pass
 
 
+_OWNED_DB_KEY = "_owned_session_db"
+
+
+def _adopt_owned_session_db(session: dict | None, db) -> bool:
+    """Record that ``session`` owns ``db`` and must close it at teardown.
+
+    Profile-scoped sessions (app-global remote mode) get a dedicated
+    ``SessionDB`` for their profile's ``state.db`` rather than the shared
+    launch handle. Nothing else closes those: ``AIAgent.close`` deliberately
+    only ends the session row (step 7) and leaves the connection to its owner,
+    so without an explicit owner the handle survives every teardown and is
+    reclaimed only if the interpreter happens to collect the agent. A dashboard
+    backend that retains closed sessions therefore accumulates one open
+    ``state.db`` descriptor (plus its ``-wal``/``-shm``) per closed session for
+    the lifetime of the process.
+
+    Idempotent and adoption-once: a session already owning a *different* handle
+    keeps the first one and closes the rejected handle immediately, so neither
+    handle can be orphaned by a rebuild.
+
+    Returns True when ``db`` is the session's owned handle. Returns False for
+    invalid inputs and when a different handle was rejected and closed.
+    """
+    if not isinstance(session, dict) or db is None:
+        return False
+    owned = session.get(_OWNED_DB_KEY)
+    if owned is None:
+        session[_OWNED_DB_KEY] = db
+        return True
+    if owned is db:
+        return True
+    try:
+        db.close()
+    except Exception:
+        logger.debug("failed to close rejected profile session db", exc_info=True)
+    return False
+
+
+def _release_owned_session_db(session: dict | None) -> bool:
+    """Close and drop the profile-scoped handle ``session`` owns.
+
+    Returns True when a handle was actually closed. Idempotent: the reference
+    is cleared first, so a concurrent/repeat teardown is a no-op rather than a
+    double close. Never raises — teardown must not be derailed by a dead
+    connection.
+    """
+    if not isinstance(session, dict):
+        return False
+    db = session.pop(_OWNED_DB_KEY, None)
+    if db is None:
+        return False
+    try:
+        db.close()
+    except Exception:
+        logger.debug("failed to close owned profile session db", exc_info=True)
+    return True
+
+
 def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") -> None:
     """Fully tear down a session: finalize, unregister, close agent + worker.
 
@@ -773,6 +831,10 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
             agent.close()
     except Exception:
         pass
+    # Release the profile-scoped SQLite handle this session owns, if any.
+    # Must run AFTER agent.close() — that path writes the session's terminal
+    # row through this same connection (AIAgent.close step 7, end_session).
+    _release_owned_session_db(session)
     # NOTE: the slash-worker is closed inside _finalize_session (the single
     # _finalized-guarded chokepoint that main folded it into), exactly once.
     # We deliberately do NOT re-close it here — _teardown_session's job beyond
@@ -1849,6 +1911,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     session_db = SessionDB(db_path=Path(profile_home) / "state.db")
                 except Exception:
                     session_db = None
+                else:
+                    # The session owns this handle now — teardown closes it.
+                    # Without the adoption the connection outlives every close
+                    # and the backend accrues one state.db fd per session.
+                    _adopt_owned_session_db(current, session_db)
             try:
                 # Lazy-resumed (watch) sessions carry the stored conversation
                 # id — pass it through so the upgrade continues that session
@@ -1967,6 +2034,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     unregister_gateway_notify(key)
                 except Exception:
                     pass
+            # A session reaped or replaced mid-build never reaches
+            # _teardown_session with this record, so release the profile handle
+            # it adopted here rather than leaving it open for the process life.
+            if replaced:
+                _release_owned_session_db(current)
             ready.set()
 
     build_thread = threading.Thread(target=_build, daemon=True)
@@ -7082,6 +7154,34 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
 
 @method("session.resume")
 def _(rid, params: dict) -> dict:
+    """Ownership wrapper around the resume handler.
+
+    ``session.resume`` mints a profile-scoped ``SessionDB`` for a non-launch
+    profile before it knows which of its several exits it will take. Only the
+    eager path hands that handle to a live session (which then owns it); the
+    lazy/watch and deferred-build paths return without ever giving it an owner,
+    and the deferred build re-mints its own handle anyway. Left unowned the
+    connection is never closed, so every sidebar chat-switch in the desktop app
+    permanently adds a ``state.db`` (+ ``-wal``/``-shm``) descriptor to the
+    backend process.
+
+    Close the handle on the way out unless the inner handler adopted it onto a
+    live session.
+    """
+    box: dict = {}
+    try:
+        return _session_resume(rid, params, box)
+    finally:
+        if not box.get("adopted"):
+            db = box.pop("db", None)
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    logger.debug("failed to close resume profile db", exc_info=True)
+
+
+def _session_resume(rid, params: dict, _db_box: dict) -> dict:
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
@@ -7094,12 +7194,14 @@ def _(rid, params: dict) -> dict:
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
 
-    # In a profile scope, the agent OWNS a long-lived db handle bound to that
-    # profile (do NOT auto-close it here). Otherwise reuse the shared launch db.
+    # In a profile scope this handle is minted here and is NOT owned by anyone
+    # yet — record it in ``_db_box`` so the wrapper closes it on every exit
+    # that does not hand it to a live session (which sets ``adopted``).
     if profile_home is not None:
         from hermes_state import SessionDB
 
         db = SessionDB(db_path=profile_home / "state.db")
+        _db_box["db"] = db
     else:
         db = _get_db()
     if db is None:
@@ -7434,6 +7536,12 @@ def _(rid, params: dict) -> dict:
                     session_db=db,
                     source=source,
                 )
+                # The live session now owns the profile handle: teardown closes
+                # it, and the wrapper must not close it out from under a
+                # running session.
+                if profile_home is not None:
+                    _adopt_owned_session_db(_sessions.get(sid), db)
+                    _db_box["adopted"] = True
             finally:
                 if init_home_token is not None:
                     reset_hermes_home_override(init_home_token)
@@ -10161,6 +10269,7 @@ def _(rid, params: dict) -> dict:
             if lease is not None:
                 lease.release()
             return _err(rid, 5008, f"branch failed: {e}")
+    branch_db = None
     try:
         # Bind the branched AGENT to the parent's profile, mirroring
         # session.create/resume: home override so config/skills/memory resolve
@@ -10170,7 +10279,6 @@ def _(rid, params: dict) -> dict:
         # parent's db while the agent stayed on the launch handle would
         # recreate the cross-profile split one turn later.
         parent_home = session.get("profile_home")
-        branch_db = None
         if parent_home:
             from hermes_state import SessionDB
 
@@ -10201,6 +10309,10 @@ def _(rid, params: dict) -> dict:
                 source=source,
                 profile_home=parent_home,
             )
+            # The branch session owns the handle minted above; without this the
+            # connection outlives the branch and leaks a state.db descriptor.
+            if branch_db is not None:
+                _adopt_owned_session_db(_sessions.get(new_sid), branch_db)
         finally:
             if home_token is not None:
                 reset_hermes_home_override(home_token)
@@ -10209,6 +10321,13 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         if lease is not None:
             lease.release()
+        # The branch handle never reached a live session on this path, so
+        # nothing else will ever close it.
+        if branch_db is not None and _sessions.get(new_sid) is None:
+            try:
+                branch_db.close()
+            except Exception:
+                logger.debug("failed to close orphaned branch db", exc_info=True)
         return _err(rid, 5000, f"agent init failed on branch: {e}")
     return _ok(rid, {"session_id": new_sid, "title": title, "parent": old_key})
 
