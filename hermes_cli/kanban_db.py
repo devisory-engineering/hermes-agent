@@ -4013,41 +4013,43 @@ def _synthesize_ended_run(
 # ---------------------------------------------------------------------------
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
+    """Return True when ``task_id`` must stay ``blocked`` until explicit
+    ``kanban_unblock`` / ``unblock_task``.
 
-    A ``blocked`` status can come from two very different sources:
+    A ``blocked`` status can come from three sources:
 
     * **Worker- or operator-initiated** — a worker called
       ``kanban_block(reason="review-required: ...")`` (or somebody ran
-      ``hermes kanban block <id>``).  This is a deliberate handoff that
-      should stay blocked until an operator unblocks it.  The block tool
-      emits a ``"blocked"`` event row in ``task_events``.
+      ``hermes kanban block <id>``).  Emits a ``"blocked"`` event.  This
+      is a deliberate handoff that should stay parked until an operator
+      unblocks it (#28712).
 
     * **Circuit-breaker** — ``_record_task_failure`` tripped after
-      repeated crashes / spawn failures / timeouts.  This emits
-      ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
-      automatically once the underlying conditions change (e.g. parents
-      finish, transient infra error clears).
+      repeated crashes / spawn failures / timeouts, OR a systemic
+      same-error crash batch forced ``failure_limit=1``.  Emits
+      ``"gave_up"`` (not ``"blocked"``).  The trip is durable intent:
+      ``recompute_ready`` must NOT unlock it just because the dispatcher's
+      configured ``kanban.failure_limit`` is higher than the effective
+      limit that tripped the breaker (cohort 2026-07-27: systemic
+      ``gave_up(failures=1, effective_limit=1)`` immediately followed by
+      ``promoted`` under config limit 2 → green-when-broken).
 
-    The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
+    * **Legacy / direct SQL** — ``status='blocked'`` with neither event.
+      Those still auto-recover via the consecutive_failures guard so
+      pre-#28712 tooling keeps working.
 
-    Returns ``False`` when there is no such event at all (e.g. the task
-    was set to ``status='blocked'`` by the circuit breaker or by direct
-    DB manipulation) — preserves the pre-#28712 auto-recover semantics
-    for that path.
+    Stickiness looks at the most recent ``blocked`` / ``unblocked`` /
+    ``gave_up`` event.  ``blocked`` or ``gave_up`` wins (sticky);
+    ``unblocked`` clears stickiness so a deliberate operator unblock is
+    the only exit for both worker-block and circuit-breaker trips.
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'gave_up') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] in ("blocked", "gave_up")
 
 
 def recompute_ready(
@@ -4066,7 +4068,13 @@ def recompute_ready(
        ``kanban_block`` — those stay blocked until an explicit
        ``kanban_unblock`` (#28712).
 
-    2. The task's ``consecutive_failures`` has reached the effective
+    2. The most recent event is a circuit-breaker ``gave_up``.  Systemic
+       trips use an effective limit of 1 while the dispatcher may still
+       pass ``kanban.failure_limit`` (often 2) into this function; the
+       ``gave_up`` event is therefore the durable sticky signal, not the
+       numeric comparison alone (2026-07-27 cohort).
+
+    3. The task's ``consecutive_failures`` has reached the effective
        failure limit.  This prevents infinite retry loops when a task
        repeatedly exhausts its iteration budget: without this guard the
        counter would reset on every recovery cycle and the circuit
@@ -6815,6 +6823,32 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
             _recent_worker_exits.pop(_pid, None)
 
 
+def _claim_lock_is_foreign_dispatcher(claim_lock: Optional[str]) -> bool:
+    """Return True when ``claim_lock`` names a different dispatcher PID.
+
+    ``claim_task`` stores ``host:pid`` via ``_claimer_id()`` (the embedded
+    gateway/dispatcher process). After a graceful gateway restart the new
+    process has a new PID, so every in-flight row still carries the *prior*
+    claimer's lock while ``_recent_worker_exits`` is empty (process-local).
+    That combination is the deploy/restart cold-reap window: dead workers
+    must classify as ``interrupted``, not hard crashes, otherwise a single
+    restart batch trips the systemic breaker.
+
+    Custom claimer strings used by tests/tools (non-numeric pid suffix, e.g.
+    ``host:worker-1``) return False so they keep ordinary crash accounting.
+    """
+    if not claim_lock:
+        return False
+    try:
+        _host, pid_s = str(claim_lock).rsplit(":", 1)
+        claimer_pid = int(pid_s)
+    except (TypeError, ValueError):
+        return False
+    if claimer_pid <= 0:
+        return False
+    return claimer_pid != os.getpid()
+
+
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     """Classify a recently-reaped worker by pid.
 
@@ -7529,6 +7563,17 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
+            # Cold-reap after dispatcher/gateway restart: the process-local
+            # reap registry is empty, so graceful SIGTERM kills look like
+            # ``unknown``. When the claim_lock still names the *prior*
+            # dispatcher PID, treat the death as an infrastructure interrupt
+            # (no failure count) instead of a hard crash. Same-process
+            # unknowns (numeric lock matches our PID, or non-numeric custom
+            # claimers) keep existing crashed-counter behaviour.
+            if kind == "unknown" and _claim_lock_is_foreign_dispatcher(
+                row["claim_lock"]
+            ):
+                kind, code = ("interrupted", 15)
             rate_limited_exit = False
             interrupted_exit = False
             if kind == "clean_exit":
