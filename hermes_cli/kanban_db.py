@@ -6823,32 +6823,6 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
             _recent_worker_exits.pop(_pid, None)
 
 
-def _claim_lock_is_foreign_dispatcher(claim_lock: Optional[str]) -> bool:
-    """Return True when ``claim_lock`` names a different dispatcher PID.
-
-    ``claim_task`` stores ``host:pid`` via ``_claimer_id()`` (the embedded
-    gateway/dispatcher process). After a graceful gateway restart the new
-    process has a new PID, so every in-flight row still carries the *prior*
-    claimer's lock while ``_recent_worker_exits`` is empty (process-local).
-    That combination is the deploy/restart cold-reap window: dead workers
-    must classify as ``interrupted``, not hard crashes, otherwise a single
-    restart batch trips the systemic breaker.
-
-    Custom claimer strings used by tests/tools (non-numeric pid suffix, e.g.
-    ``host:worker-1``) return False so they keep ordinary crash accounting.
-    """
-    if not claim_lock:
-        return False
-    try:
-        _host, pid_s = str(claim_lock).rsplit(":", 1)
-        claimer_pid = int(pid_s)
-    except (TypeError, ValueError):
-        return False
-    if claimer_pid <= 0:
-        return False
-    return claimer_pid != os.getpid()
-
-
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     """Classify a recently-reaped worker by pid.
 
@@ -7563,17 +7537,6 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
-            # Cold-reap after dispatcher/gateway restart: the process-local
-            # reap registry is empty, so graceful SIGTERM kills look like
-            # ``unknown``. When the claim_lock still names the *prior*
-            # dispatcher PID, treat the death as an infrastructure interrupt
-            # (no failure count) instead of a hard crash. Same-process
-            # unknowns (numeric lock matches our PID, or non-numeric custom
-            # claimers) keep existing crashed-counter behaviour.
-            if kind == "unknown" and _claim_lock_is_foreign_dispatcher(
-                row["claim_lock"]
-            ):
-                kind, code = ("interrupted", 15)
             rate_limited_exit = False
             interrupted_exit = False
             if kind == "clean_exit":

@@ -1271,14 +1271,10 @@ def test_dispatch_result_surfaces_interrupted(kanban_home, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Sticky systemic gave_up + cold-reap restart classification (t_3892a21a /
-# cohort 2026-07-27). Systemic trips force failure_limit=1 while the
-# dispatcher still passes kanban.failure_limit=2 into recompute_ready; the
-# gave_up event must keep the card parked. Separately, after a gateway
-# restart the process-local reap registry is empty and prior claim locks
-# still name the dead dispatcher PID — those orphaned workers must classify
-# as interrupted (no failure count), not hard crashes that feed a systemic
-# batch trip.
+# Sticky systemic gave_up classification (t_3892a21a / cohort 2026-07-27).
+# Systemic trips force failure_limit=1 while the dispatcher still passes
+# kanban.failure_limit=2 into recompute_ready; the gave_up event must keep
+# the card parked.
 # ---------------------------------------------------------------------------
 
 
@@ -1378,122 +1374,6 @@ def test_dispatch_once_preserves_systemic_gave_up_under_config_limit(
         assert result.promoted == 0
         for tid in task_ids:
             assert kb.get_task(conn, tid).status == "blocked"
-
-
-def test_cold_reap_foreign_claimer_classifies_as_interrupted(
-    kanban_home, monkeypatch,
-):
-    """Empty reap registry + prior dispatcher PID → interrupted, not crash."""
-    import hermes_cli.kanban_db as _kb
-
-    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
-    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
-    # Simulate cold start: no process-local reap observations.
-    _kb._recent_worker_exits.clear()
-
-    with kb.connect() as conn:
-        host = _kb._claimer_id().split(":", 1)[0]
-        # Prior dispatcher PID (gateway restarted; our PID is os.getpid()).
-        prior_pid = os.getpid() + 12345
-        assert prior_pid != os.getpid()
-        prior_lock = f"{host}:{prior_pid}"
-        task_ids = []
-        now = int(time.time())
-        for i in range(3):
-            tid = kb.create_task(conn, title=f"cold-reap-{i}", assignee="a")
-            # Real claim so task_runs + current_run_id exist, then rewrite the
-            # claim_lock to the *prior* dispatcher identity (cold-reap window).
-            assert kb.claim_task(conn, tid, claimer=prior_lock) is not None
-            conn.execute(
-                "UPDATE tasks SET worker_pid=?, consecutive_failures=0, "
-                "started_at=? WHERE id=?",
-                (872000 + i, now - 120, tid),
-            )
-            task_ids.append(tid)
-        conn.commit()
-
-        crashed = kb.detect_crashed_workers(conn)
-        assert crashed == []
-        interrupted = getattr(
-            _kb.detect_crashed_workers, "_last_interrupted", []
-        )
-        assert set(interrupted) == set(task_ids)
-        auto = getattr(_kb.detect_crashed_workers, "_last_auto_blocked", [])
-        assert auto == []
-
-        for tid in task_ids:
-            task = kb.get_task(conn, tid)
-            assert task.status == "ready"
-            assert task.consecutive_failures == 0
-            assert "graceful termination" in (task.last_failure_error or "")
-
-        outcomes = [
-            r["outcome"]
-            for r in conn.execute(
-                "SELECT outcome FROM task_runs WHERE task_id IN ({})".format(
-                    ",".join("?" * len(task_ids))
-                ),
-                task_ids,
-            ).fetchall()
-        ]
-        assert outcomes and all(o == "interrupted" for o in outcomes)
-        assert "crashed" not in outcomes
-        kinds = [
-            r["kind"]
-            for r in conn.execute(
-                "SELECT kind FROM task_events WHERE task_id IN ({})".format(
-                    ",".join("?" * len(task_ids))
-                ),
-                task_ids,
-            ).fetchall()
-        ]
-        assert "interrupted" in kinds
-        assert "gave_up" not in kinds
-        assert "crashed" not in kinds
-
-
-def test_same_process_unknown_exit_still_counts_as_crash(
-    kanban_home, monkeypatch,
-):
-    """Same-dispatcher claim_lock with unknown exit still hard-crashes."""
-    import hermes_cli.kanban_db as _kb
-
-    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
-    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
-    _kb._recent_worker_exits.clear()
-
-    with kb.connect() as conn:
-        # claim_lock matches *this* process (normal same-tick unknown path).
-        lock = _kb._claimer_id()
-        tid = kb.create_task(conn, title="same-process-unknown", assignee="a")
-        now = int(time.time())
-        conn.execute(
-            "UPDATE tasks SET status='running', worker_pid=?, "
-            "claim_lock=?, started_at=? WHERE id=?",
-            (873000, lock, now - 120, tid),
-        )
-        conn.commit()
-
-        crashed = kb.detect_crashed_workers(conn)
-        assert tid in crashed
-        interrupted = getattr(
-            _kb.detect_crashed_workers, "_last_interrupted", []
-        )
-        assert tid not in interrupted
-        task = kb.get_task(conn, tid)
-        assert task.status == "ready"
-        assert task.consecutive_failures == 1
-
-
-def test_claim_lock_is_foreign_dispatcher_helper():
-    import hermes_cli.kanban_db as _kb
-
-    me = os.getpid()
-    assert _kb._claim_lock_is_foreign_dispatcher(f"host:{me}") is False
-    assert _kb._claim_lock_is_foreign_dispatcher(f"host:{me + 99}") is True
-    assert _kb._claim_lock_is_foreign_dispatcher("host:worker-1") is False
-    assert _kb._claim_lock_is_foreign_dispatcher(None) is False
-    assert _kb._claim_lock_is_foreign_dispatcher("") is False
 
 
 def test_respawn_guard_defers_rate_limited_within_cooldown(
