@@ -1269,6 +1269,113 @@ def test_dispatch_result_surfaces_interrupted(kanban_home, monkeypatch):
         assert tid not in result.rate_limited
 
 
+
+# ---------------------------------------------------------------------------
+# Sticky systemic gave_up classification (t_3892a21a / cohort 2026-07-27).
+# Systemic trips force failure_limit=1 while the dispatcher still passes
+# kanban.failure_limit=2 into recompute_ready; the gave_up event must keep
+# the card parked.
+# ---------------------------------------------------------------------------
+
+
+def test_systemic_gave_up_sticky_against_higher_recompute_limit(
+    kanban_home, monkeypatch,
+):
+    """crashed → gave_up(effective_limit=1) must not promote under config=2."""
+    import json
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    # Process-local reap registry must start empty so prior tests' exit
+    # classifications cannot turn this cohort into interrupted/rate-limited.
+    _kb._recent_worker_exits.clear()
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        task_ids = []
+        now = int(time.time())
+        for i in range(3):
+            tid = kb.create_task(conn, title=f"sys-sticky-{i}", assignee="a")
+            # Non-numeric claimer suffixes isolate the systemic/sticky path
+            # from the foreign-dispatcher cold-reap carve-out. started_at is
+            # forced into the past so launch-window grace cannot skip us.
+            conn.execute(
+                "UPDATE tasks SET status='running', worker_pid=?, "
+                "claim_lock=?, consecutive_failures=0, started_at=? WHERE id=?",
+                (870000 + i, f"{host}:wsticky{i}", now - 120, tid),
+            )
+            task_ids.append(tid)
+        conn.commit()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert set(crashed) == set(task_ids)
+
+        for tid in task_ids:
+            task = kb.get_task(conn, tid)
+            assert task.status == "blocked", tid
+            assert task.consecutive_failures == 1, tid
+            row = conn.execute(
+                "SELECT kind, payload FROM task_events "
+                "WHERE task_id=? AND kind='gave_up' ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            assert row is not None, tid
+            payload = json.loads(row["payload"])
+            assert payload["failures"] == 1
+            assert payload["effective_limit"] == 1
+
+        # Dispatcher continues with config failure_limit=2 (iris default).
+        # Pre-fix this promoted blocked→ready (1 < 2) and undid the trip.
+        promoted = kb.recompute_ready(conn, failure_limit=2)
+        assert promoted == 0
+        for tid in task_ids:
+            assert kb.get_task(conn, tid).status == "blocked"
+            assert kb.get_task(conn, tid).consecutive_failures == 1
+
+        # Explicit unblock remains the recovery path.
+        assert kb.unblock_task(conn, task_ids[0])
+        t0 = kb.get_task(conn, task_ids[0])
+        assert t0.status == "ready"
+        assert t0.consecutive_failures == 0
+
+
+def test_dispatch_once_preserves_systemic_gave_up_under_config_limit(
+    kanban_home, monkeypatch,
+):
+    """Same cohort path through dispatch_once (crash detect + recompute)."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    _kb._recent_worker_exits.clear()
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        task_ids = []
+        now = int(time.time())
+        for i in range(3):
+            tid = kb.create_task(conn, title=f"sys-dispatch-{i}", assignee="a")
+            conn.execute(
+                "UPDATE tasks SET status='running', worker_pid=?, "
+                "claim_lock=?, started_at=? WHERE id=?",
+                (871000 + i, f"{host}:wdisp{i}", now - 120, tid),
+            )
+            task_ids.append(tid)
+        conn.commit()
+
+        result = kb.dispatch_once(
+            conn,
+            failure_limit=2,
+            spawn_fn=lambda *a, **k: None,
+        )
+        assert set(result.crashed) == set(task_ids)
+        assert set(result.auto_blocked) == set(task_ids)
+        assert result.promoted == 0
+        for tid in task_ids:
+            assert kb.get_task(conn, tid).status == "blocked"
+
+
 def test_respawn_guard_defers_rate_limited_within_cooldown(
     kanban_home, monkeypatch,
 ):
