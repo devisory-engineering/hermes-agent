@@ -2103,6 +2103,85 @@ class _PreToolCallDirective:
     action: Optional[str] = None
     message: Optional[str] = None
     rule_key: Optional[str] = None
+    hard_stop: bool = False
+
+
+# Capability marker a plugin can probe (``getattr(plugins,
+# "PRE_TOOL_CALL_HARD_STOP_SUPPORTED", False)``) to learn whether the running
+# core honors ``hard_stop`` on a block directive. Budget/circuit-breaker
+# plugins report a *claimed* hard stop in their audit trail; without a probe
+# they cannot tell an enforcing core from one that only skips the tool, and a
+# log line saying "session terminated" while the loop keeps spending is the
+# green-when-broken failure this flag exists to prevent.
+PRE_TOOL_CALL_HARD_STOP_SUPPORTED = True
+
+
+# Pending hard-stop requests, set when a ``pre_tool_call`` hook returns a block
+# directive carrying ``hard_stop: True``. A plugin's only veto point is the
+# tool call, so before this existed a tripped cost cap could block every tool
+# yet leave the conversation loop free to keep producing (billable) turns until
+# something external ended the session. The conversation loop consumes the
+# latch for its own session and ends the run.
+#
+# Keyed BY SESSION ID: the gateway runs turns for several sessions on a thread
+# pool, so a module-global latch races — session B's run-start clear could drop
+# A's trip, and B's drain could consume A's stop and kill an innocent session.
+# ``resolve_pre_tool_block`` already receives ``session_id`` and every
+# production dispatch site passes the live agent's id. The ``""`` key is the
+# bucket for callers that pass no session id (single-run CLI contexts, where
+# there is no cross-session concurrency); the loop drains its own session's
+# entry first and falls back to that bucket. Lock-guarded because tool calls
+# in one turn can be dispatched across worker threads while the loop that must
+# stop runs on the main thread.
+_hard_stop_lock = threading.Lock()
+_hard_stop_requests: Dict[str, str] = {}
+
+
+def request_hard_stop(message: str, session_id: str = "") -> None:
+    """Latch a plugin-requested hard stop (first request per session wins)."""
+    key = session_id or ""
+    with _hard_stop_lock:
+        if key not in _hard_stop_requests:
+            _hard_stop_requests[key] = message or "plugin requested a hard stop"
+
+
+def hard_stop_requested(session_id: str = "") -> Optional[str]:
+    """Return the pending hard-stop message for this session, uncleared."""
+    with _hard_stop_lock:
+        message = _hard_stop_requests.get(session_id or "")
+        if message is None and session_id:
+            message = _hard_stop_requests.get("")
+        return message
+
+
+def consume_hard_stop(session_id: str = "") -> Optional[str]:
+    """Return and clear the pending hard-stop message for this session.
+
+    Falls back to (and drains) the ``""`` bucket so a dispatch path that
+    could not name its session still stops the run that is actually draining.
+    """
+    with _hard_stop_lock:
+        message = _hard_stop_requests.pop(session_id or "", None)
+        if message is None and session_id:
+            message = _hard_stop_requests.pop("", None)
+        return message
+
+
+def clear_hard_stop(session_id: Optional[str] = None) -> None:
+    """Drop pending hard-stop request(s).
+
+    ``session_id=None`` clears everything (tests / full resets). A named
+    session clears its own latch AND the anonymous ``""`` bucket — run start
+    must not inherit a stale anonymous trip from an earlier run in the same
+    process, and the anonymous bucket is only ever used where no concurrent
+    sibling sessions exist.
+    """
+    with _hard_stop_lock:
+        if session_id is None:
+            _hard_stop_requests.clear()
+        else:
+            _hard_stop_requests.pop(session_id or "", None)
+            _hard_stop_requests.pop("", None)
 
 
 def set_thread_tool_whitelist(
@@ -2189,7 +2268,19 @@ def _get_pre_tool_call_directive_details(
         rule_key = rule_key.strip() if isinstance(rule_key, str) else None
         if not rule_key:
             rule_key = None
-        return _PreToolCallDirective(action=action, message=message, rule_key=rule_key)
+        # ``hard_stop`` (block directives only) escalates a veto into "end the
+        # run": the tool is still blocked with ``message``, and the
+        # conversation loop terminates instead of letting the model keep
+        # producing turns past a tripped budget/safety cap. Approve directives
+        # never escalate — turning "ask a human" into "abort" would surprise
+        # every caller.
+        hard_stop = action == "block" and bool(result.get("hard_stop"))
+        return _PreToolCallDirective(
+            action=action,
+            message=message,
+            rule_key=rule_key,
+            hard_stop=hard_stop,
+        )
 
     return _PreToolCallDirective()
 
@@ -2274,6 +2365,15 @@ def resolve_pre_tool_block(
         api_request_id=api_request_id, middleware_trace=middleware_trace,
     )
     if details.action == "block":
+        if details.hard_stop:
+            # Latch a run-level stop for THIS session (see the latch notes
+            # above) so a tripped budget/safety cap actually ends the run
+            # instead of merely skipping tools while the model keeps
+            # producing billable turns.
+            request_hard_stop(
+                details.message or f"{tool_name} blocked (hard stop)",
+                session_id=session_id,
+            )
         return details.message
     if details.action == "approve":
         try:

@@ -669,6 +669,149 @@ def test_dispatch_once_preserves_systemic_gave_up_under_config_limit(
             assert kb.get_task(conn, tid).status == "blocked"
 
 
+def test_classify_worker_exit_recognizes_hard_stop_sentinel(kanban_home):
+    """EX_NOPERM marks "a plugin policy stopped this run", distinct from both a
+    quota wall (EX_TEMPFAIL, retry later) and a real crash."""
+    import hermes_cli.kanban_db as _kb
+
+    pid = 41337
+    _kb._record_worker_exit(pid, _exited_status(_kb.KANBAN_HARD_STOP_EXIT_CODE))
+    kind, code = _kb._classify_worker_exit(pid)
+    assert kind == "hard_stop"
+    assert code == _kb.KANBAN_HARD_STOP_EXIT_CODE
+    # And it must not collide with the rate-limit sentinel.
+    assert _kb.KANBAN_HARD_STOP_EXIT_CODE != _kb.KANBAN_RATE_LIMIT_EXIT_CODE
+
+
+def test_hard_stop_exit_blocks_task_without_counting_failure(
+    kanban_home, monkeypatch,
+):
+    """A plugin hard stop parks the card in ``blocked`` for a human — STICKY.
+
+    Regression for the cost-cap incident: the trip vetoed the worker's own
+    kanban_complete/kanban_block, so the worker exited without a terminal
+    transition. Classified as a clean exit that was a protocol violation, the
+    card was released to ``ready`` and respawned straight back into the same
+    cap. It must instead land in ``blocked`` — no failure counted (the task
+    isn't broken), no respawn (the budget hasn't changed) — and the block must
+    be sticky against ``recompute_ready`` (2026-08-05 review finding 1: a
+    non-sticky block with failures=0 is promoted back in the SAME tick).
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="hs", assignee="a")
+        pid = 80001
+
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, consecutive_failures=0 WHERE id=?",
+            (pid, tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(
+            pid, _exited_status(_kb.KANBAN_HARD_STOP_EXIT_CODE)
+        )
+
+        crashed = kb.detect_crashed_workers(conn)
+
+        # Not a crash, and not a rate-limited requeue.
+        assert tid not in crashed
+        assert tid not in getattr(
+            _kb.detect_crashed_workers, "_last_rate_limited", []
+        )
+        assert tid in getattr(
+            _kb.detect_crashed_workers, "_last_hard_stopped", []
+        )
+
+        task = kb.get_task(conn, tid)
+        # Terminal for the dispatcher: a ``blocked`` card is never respawned.
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 0
+        assert task.block_kind == "capability"
+        assert task.last_failure_error
+        assert "hard-stopped" in task.last_failure_error
+
+        outcomes = [
+            r["outcome"] for r in conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id=?", (tid,),
+            ).fetchall()
+        ]
+        assert "hard_stop" in outcomes
+        assert "crashed" not in outcomes
+
+        # STICKY: the hard_stop event pins the block against recompute_ready
+        # even though consecutive_failures is 0 and every failure_limit is
+        # satisfied. Only an explicit unblock clears it.
+        assert _kb._has_sticky_block(conn, tid) is True
+        assert kb.recompute_ready(conn, failure_limit=2) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_hard_stop_not_respawned_across_two_dispatch_ticks(
+    kanban_home, monkeypatch,
+):
+    """THE two-tick proof (2026-08-05 review findings 1 + 2).
+
+    The original patch parked the card with a raw ``status='blocked'`` UPDATE
+    and a non-sticky event: ``recompute_ready`` — which runs INSIDE the same
+    ``_dispatch_once_locked`` tick, after crash detection and before the ready
+    SELECT — promoted it straight back (failures=0 passes every limit) and the
+    spawn loop respawned it into the tripped cap. And the old no-respawn test
+    was vacuous: its card's assignee had no profile, so the profile_exists
+    gate skipped the spawn regardless of hard-stop semantics. Here
+    ``profile_exists`` is stubbed True, so a promoted card WOULD spawn — the
+    only thing standing between the card and a burn loop is the sticky block.
+    """
+    import hermes_cli.kanban_db as _kb
+    import hermes_cli.profiles as _profiles
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(_profiles, "profile_exists", lambda _name: True)
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="hs-two-tick", assignee="a")
+        pid = 80002
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(
+            pid, _exited_status(_kb.KANBAN_HARD_STOP_EXIT_CODE)
+        )
+
+        spawned = []
+
+        def _spawn(task, ws, **kw):
+            spawned.append(task.id)
+            return 4242
+
+        # Tick 1: the tick that reaps the hard-stopped worker.
+        result1 = _kb._dispatch_once_locked(conn, spawn_fn=_spawn)
+        assert result1.hard_stopped == [tid]
+        assert tid not in result1.crashed
+        assert tid not in result1.rate_limited
+        assert spawned == [], "hard-stopped card respawned in the same tick"
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        # Tick 2: a fresh tick with no crash to account — only recompute_ready
+        # and the spawn loop. A non-sticky block dies here.
+        result2 = _kb._dispatch_once_locked(conn, spawn_fn=_spawn)
+        assert result2.promoted == 0
+        assert spawned == [], "hard-stopped card respawned on the next tick"
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.get_task(conn, tid).consecutive_failures == 0
+
+
 def test_respawn_guard_defers_rate_limited_within_cooldown(
     kanban_home, monkeypatch,
 ):
