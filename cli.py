@@ -10725,6 +10725,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             )
             return
 
+        # Same auto-pause for a plugin hard stop (cost cap / circuit breaker):
+        # the judge would read the truncated output, say "continue", and
+        # immediately re-queue a turn against the very cap that just ended the
+        # run. Mirror the interrupt path — pause, tell the user why, bail.
+        if getattr(self, "_last_turn_hard_stop", False):
+            try:
+                mgr.pause(reason="plugin hard stop (budget/safety cap)")
+            except Exception as exc:
+                logging.debug("goal pause-on-hard-stop failed: %s", exc)
+            _cprint(
+                f"  {_DIM}⏸ Goal paused — run was hard-stopped by a plugin "
+                f"policy. Resolve the cap, then /goal resume.{_RST}"
+            )
+            return
+
         # Extract the agent's final response for this turn.
         last_response = ""
         try:
@@ -14257,6 +14272,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # Expose the flag for post-turn hooks (e.g. goal continuation)
             # so they can skip themselves when the turn was user-cancelled.
             self._last_turn_interrupted = _interrupted_this_turn
+            # A plugin hard stop (cost cap / circuit breaker) ended the run by
+            # policy. Surface it so the one-shot exit paths can return the
+            # kanban hard-stop sentinel instead of a clean rc=0 — the trip
+            # vetoes the worker's own kanban_complete/kanban_block, so rc=0
+            # would be misread as a protocol violation and respawned.
+            self._last_turn_hard_stop = bool(result and result.get("plugin_hard_stop"))
             if _interrupted_this_turn:
                 pending_message = result.get("interrupt_message") or interrupt_msg
                 # Add indicator that we were interrupted
@@ -17900,6 +17921,14 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
 
     max_turns = task.goal_max_turns or _DEF_TURNS
 
+    class _GoalHardStop(Exception):
+        """Raised by ``_run_turn`` to break the goal loop on a plugin hard stop.
+
+        ``goals.run_kanban_goal_loop`` only sees response STRINGS, so without
+        this a tripped cost cap would keep the loop burning up to
+        ``max_turns`` more model turns plus a judge call per turn — every one
+        of them against the already-tripped cap."""
+
     def _run_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(
             user_message=prompt,
@@ -17911,9 +17940,17 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             and cli.agent.session_id != cli.session_id
         ):
             cli.session_id = cli.agent.session_id
+        # Stash the hard-stop flag where the one-shot exit path reads it
+        # (``result`` there is turn 1's dict; the trip can land on turn N).
+        _hard_stopped = bool(
+            isinstance(result, dict) and result.get("plugin_hard_stop")
+        )
+        cli._last_turn_hard_stop = _hard_stopped
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
             print(resp)
+        if _hard_stopped:
+            raise _GoalHardStop(resp or "plugin hard stop")
         return resp or ""
 
     def _task_status() -> "str | None":
@@ -17947,6 +17984,16 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
     )
+    if getattr(cli, "_last_turn_hard_stop", False):
+        # ``_run_turn`` raised ``_GoalHardStop``; ``run_kanban_goal_loop``
+        # catches run_turn exceptions and returns outcome="stopped", which is
+        # exactly the break we want. This is a deliberate terminal exit, not a
+        # loop failure: the caller's exit path reads ``_last_turn_hard_stop``
+        # and returns the EX_NOPERM sentinel so the dispatcher blocks the card
+        # instead of respawning it into the same cap.
+        logger.warning(
+            "kanban goal loop ended by plugin hard stop (task %s)", task_id
+        )
 
 
 def main(
@@ -18408,10 +18455,19 @@ def main(
                         # dispatcher sets in `_default_spawn`; a no-op for every
                         # normal worker and every non-kanban `-q` run.
                         if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
-                            try:
-                                _run_kanban_goal_loop_q(cli, response)
-                            except Exception as _goal_exc:
-                                logger.debug("kanban goal loop failed: %s", _goal_exc)
+                            if isinstance(result, dict) and result.get("plugin_hard_stop"):
+                                # First turn already tripped the cap — entering
+                                # the goal loop would burn judge calls + model
+                                # turns against the very cap that ended the run.
+                                logger.warning(
+                                    "kanban goal loop skipped: first turn was "
+                                    "hard-stopped by a plugin policy"
+                                )
+                            else:
+                                try:
+                                    _run_kanban_goal_loop_q(cli, response)
+                                except Exception as _goal_exc:
+                                    logger.debug("kanban goal loop failed: %s", _goal_exc)
 
                         # Session ID goes to stderr so piped stdout is clean.
                         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
@@ -18428,7 +18484,24 @@ def main(
                         # 5-hour quota window can't trip the circuit breaker and
                         # permanently block the card. Non-kanban runs keep the
                         # plain 0/1 contract automation wrappers expect.
+                        #
+                        # A plugin hard stop (cost cap / circuit breaker) gets
+                        # its own EX_NOPERM sentinel. The trip vetoes every
+                        # remaining tool call — including the worker's own
+                        # kanban_complete / kanban_block — so the worker CANNOT
+                        # reach a terminal board state by itself. Without the
+                        # sentinel this looked like a clean rc=0 exit with the
+                        # task still ``running``, i.e. a protocol violation,
+                        # and the dispatcher respawned the card straight back
+                        # into the same cap. ``_last_turn_hard_stop`` is
+                        # consulted alongside the first turn's result because a
+                        # goal-mode trip can land on turn N>1 — ``result`` here
+                        # is turn 1's dict.
                         _exit_code = 0
+                        _hard_stopped = bool(
+                            isinstance(result, dict)
+                            and result.get("plugin_hard_stop")
+                        ) or bool(getattr(cli, "_last_turn_hard_stop", False))
                         if isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
                             if os.environ.get("HERMES_KANBAN_TASK") and result.get(
@@ -18441,6 +18514,14 @@ def main(
                                     _exit_code = _RL_CODE
                                 except Exception:
                                     _exit_code = 1
+                        if os.environ.get("HERMES_KANBAN_TASK") and _hard_stopped:
+                            try:
+                                from hermes_cli.kanban_db import (
+                                    KANBAN_HARD_STOP_EXIT_CODE as _HS_CODE,
+                                )
+                                _exit_code = _HS_CODE
+                            except Exception:
+                                _exit_code = 1
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails
@@ -18467,6 +18548,30 @@ def main(
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
+                # Kanban workers spawned WITHOUT -Q (every non-goal-mode card)
+                # land here, not in the quiet branch above, so this path needs
+                # its own hard-stop sentinel. A plugin cost-cap /
+                # circuit-breaker trip vetoes every remaining tool call —
+                # including the worker's own kanban_complete / kanban_block —
+                # so the run cannot reach a terminal board state. Falling off
+                # the end of this branch exits 0 with the task still
+                # ``running``, which the dispatcher reads as a protocol
+                # violation and respawns straight back into the same cap.
+                # EX_NOPERM tells it "stopped by policy: block the card, don't
+                # count a failure, don't respawn."
+                if (
+                    os.environ.get("HERMES_KANBAN_TASK")
+                    and getattr(cli, "_last_turn_hard_stop", False)
+                ):
+                    try:
+                        from hermes_cli.kanban_db import (
+                            KANBAN_HARD_STOP_EXIT_CODE as _HS_CODE,
+                        )
+                    except Exception:
+                        _HS_CODE = 1
+                    # ``finally: _finalize_single_query(cli)`` below runs on
+                    # the SystemExit unwind — don't finalize twice.
+                    sys.exit(_HS_CODE)
         finally:
             _finalize_single_query(cli)
         return

@@ -672,6 +672,18 @@ def finalize_turn(
         result["error"] = final_response or (
             "session storage could not be written — free disk space and try again"
         )
+    # A plugin hard stop (budget / circuit-breaker cap) is a terminal,
+    # non-retryable end to the run — surface it as a classified failure so
+    # callers can map it to a terminal exit code instead of reading the run as
+    # a clean rc=0 finish (which, for a kanban worker, looks like a protocol
+    # violation and gets respawned into the same wall).
+    _hard_stop_message = getattr(agent, "_plugin_hard_stop_message", None)
+    if _hard_stop_message:
+        result["failed"] = True
+        result["completed"] = False
+        result["error"] = f"plugin_hard_stop: {_hard_stop_message}"
+        result["failure_reason"] = "plugin_hard_stop"
+        result["plugin_hard_stop"] = {"message": _hard_stop_message}
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).

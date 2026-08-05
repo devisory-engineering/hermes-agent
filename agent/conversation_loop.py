@@ -852,6 +852,35 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
     return f"Tool '{name}' does not exist. Available tools: {available}"
 
 
+def _consume_plugin_hard_stop(agent) -> Optional[str]:
+    """Return (and clear) this session's pending plugin hard-stop, if any.
+
+    A ``pre_tool_call`` hook signals ``{"action": "block", "hard_stop": True}``
+    when its veto must end the whole run — a tripped cost cap or circuit
+    breaker, not a one-off policy denial. ``hermes_cli.plugins`` latches that
+    request per session id; the loop drains its own session here (the same id
+    the tool executor passed into ``resolve_pre_tool_block`` for this batch).
+    Import-guarded so a plugin-subsystem import error can never brick the
+    conversation loop.
+    """
+    try:
+        from hermes_cli.plugins import consume_hard_stop
+
+        return consume_hard_stop(getattr(agent, "session_id", "") or "")
+    except Exception:
+        logger.debug("plugin hard-stop check failed", exc_info=True)
+        return None
+
+
+def _plugin_hard_stop_response(message: str) -> str:
+    """User-visible text for a plugin-terminated run."""
+    return (
+        "⛔ Run stopped by a plugin policy (hard stop).\n\n"
+        f"{message}\n\n"
+        "No further model turns will be made in this run."
+    )
+
+
 def _content_policy_blocked_result(
     messages: List[Dict],
     api_call_count: int,
@@ -1340,6 +1369,18 @@ def run_conversation(
     final_response = None
     interrupted = False
     failed = False
+    # Plugin hard stops are run-scoped. Drop any stale latch left for this
+    # session by an earlier turn in this process (a gateway session reuses the
+    # module-level plugin state) so a past trip can never terminate an
+    # unrelated later run — the plugin's own cumulative state re-trips at the
+    # next tool call if the cap is still exceeded.
+    agent._plugin_hard_stop_message = None
+    try:
+        from hermes_cli.plugins import clear_hard_stop as _clear_plugin_hard_stop
+
+        _clear_plugin_hard_stop(getattr(agent, "session_id", "") or "")
+    except Exception:
+        logger.debug("plugin hard-stop reset failed", exc_info=True)
     codex_ack_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
@@ -6285,6 +6326,29 @@ def run_conversation(
                     _turn_exit_reason = "session_persistence_failed"
                     final_response = ""
                     failed = True
+                    break
+
+                # ── Plugin-requested hard stop ─────────────────────────
+                # A pre_tool_call hook returned {"action": "block",
+                # "hard_stop": True} — a budget/safety cap that must END the
+                # run, not just skip this tool. Without this the model kept
+                # producing (billable) turns against a tripped cap until the
+                # gateway or a human ended the session, and kanban workers
+                # exited rc=0 with their terminal board tools vetoed → the
+                # dispatcher recorded a protocol violation and respawned.
+                # Checked after the persistence-failure break so a disk-full
+                # turn keeps its own (more actionable) classification.
+                _hard_stop_msg = _consume_plugin_hard_stop(agent)
+                if _hard_stop_msg:
+                    _turn_exit_reason = "plugin_hard_stop"
+                    failed = True
+                    final_response = _plugin_hard_stop_response(_hard_stop_msg)
+                    agent._emit_status(f"⛔ Run stopped by plugin: {_hard_stop_msg}")
+                    messages.append({"role": "assistant", "content": final_response})
+                    agent._session_messages = messages
+                    agent._persist_session(messages, conversation_history)
+                    agent._plugin_hard_stop_message = _hard_stop_msg
+                    logger.warning("plugin hard stop: %s", _hard_stop_msg)
                     break
 
                 if agent._tool_guardrail_halt_decision is not None:

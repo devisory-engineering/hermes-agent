@@ -396,6 +396,20 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# Sentinel exit code a kanban worker uses to signal "a plugin policy
+# hard-stopped my run" — a tripped cost cap or circuit breaker, not a task
+# failure and not a transient throttle. The dispatcher maps it to a
+# ``hard_stop`` exit kind: ``detect_crashed_workers`` routes the task to
+# ``blocked`` with a STICKY ``hard_stop`` event (a human decides whether to
+# raise the budget or split the work) WITHOUT counting a failure and WITHOUT
+# a respawn — ``recompute_ready`` honors the stickiness in the SAME dispatch
+# tick, so the card cannot bounce straight back into the cap. Before this
+# existed, a cost-cap trip vetoed the worker's own ``kanban_complete`` /
+# ``kanban_block`` calls, so the worker exited rc=0 with the task still
+# ``running`` → recorded as a protocol violation → respawned into the same
+# cap. 77 == BSD ``EX_NOPERM`` (sysexits.h): the run was denied by policy.
+KANBAN_HARD_STOP_EXIT_CODE = 77
+
 
 # Signals that mean "gracefully asked to stop", NOT "the task failed".
 # A worker reaped as killed by one of these was almost certainly torn down
@@ -4271,6 +4285,14 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
       ``gave_up(failures=1, effective_limit=1)`` immediately followed by
       ``promoted`` under config limit 2 → green-when-broken).
 
+    * **Plugin hard stop** — a budget / circuit-breaker cap terminated the
+      worker (EX_NOPERM sentinel; ``detect_crashed_workers``). Emits
+      ``"hard_stop"``. Sticky for the same reason as ``gave_up``: hard stops
+      deliberately count NO failure, so without stickiness the very same
+      dispatch tick promotes the card back to ``ready`` (failures=0 clears
+      the guard) and respawns it straight into the tripped cap — an
+      unbounded burn loop the failure-limit breaker never sees.
+
     * **Legacy / direct SQL** — ``status='blocked'`` with neither event.
       Those still auto-recover via the consecutive_failures guard so
       pre-#28712 tooling keeps working.
@@ -4282,11 +4304,12 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'gave_up') "
+        "WHERE task_id = ? "
+        "AND kind IN ('blocked', 'unblocked', 'gave_up', 'hard_stop') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] in ("blocked", "gave_up")
+    return bool(row) and row["kind"] in ("blocked", "gave_up", "hard_stop")
 
 
 def recompute_ready(
@@ -7014,6 +7037,13 @@ class DispatchResult:
     and, on the second such kill inside ``failure_limit``, permanently
     ``gave_up`` an otherwise-healthy card. Genuine crashes (SIGKILL/OOM,
     SIGSEGV, …) are NOT in this bucket and still count."""
+    hard_stopped: list[str] = field(default_factory=list)
+    """Task ids whose workers were terminated by a plugin policy hard stop
+    (cost cap / circuit breaker, EX_NOPERM sentinel exit). These are routed
+    straight to ``blocked`` — with a sticky ``hard_stop`` event so
+    ``recompute_ready`` cannot promote them back in the same tick — for a
+    human budget decision: no failure counted, no respawn, retrying would
+    burn the same budget against the same cap."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -7109,6 +7139,12 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_HARD_STOP_EXIT_CODE:
+                # A plugin policy (cost cap / circuit breaker) terminated the
+                # run. Routed to ``blocked`` for a human WITHOUT counting a
+                # failure and without a respawn — retrying would just burn the
+                # same budget again.
+                return ("hard_stop", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             sig = os.WTERMSIG(raw)
@@ -7752,6 +7788,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     crashed: list[str] = []
     rate_limited: list[str] = []
     interrupted: list[str] = []
+    hard_stopped: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -7786,6 +7823,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
             interrupted_exit = False
+            hard_stop_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -7861,6 +7899,34 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "claimer": row["claim_lock"],
                     "signal": code,
                 }
+            elif kind == "hard_stop":
+                # A plugin policy (cost cap / circuit breaker) terminated the
+                # run. The task is NOT broken and the worker did nothing
+                # wrong: it was denied further tool calls — including its own
+                # kanban_complete / kanban_block — so it could not reach a
+                # terminal state itself. Route the card to ``blocked`` for a
+                # human (raise the cap, split the work, accept partial output)
+                # WITHOUT counting a failure. The ``hard_stop`` event kind is
+                # STICKY for ``recompute_ready`` (see ``_has_sticky_block``):
+                # without stickiness the very same dispatch tick would promote
+                # the card back to ``ready`` (hard stops count no failure, so
+                # the consecutive_failures guard is 0) and respawn it straight
+                # into the same cap — an unbounded burn loop, strictly worse
+                # than the failure-limit breaker it bypasses.
+                protocol_violation = False
+                hard_stop_exit = True
+                error_text = (
+                    f"pid {pid} hard-stopped by a plugin policy (budget or "
+                    f"circuit-breaker cap) before it could call "
+                    f"kanban_complete/kanban_block — blocked for review, not "
+                    f"counted as a task failure and not respawned"
+                )
+                event_kind = "hard_stop"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                }
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -7876,18 +7942,26 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_code"] = code
 
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
+                (
+                    "blocked" if hard_stop_exit else "ready",
+                    row["id"], pid, row["claim_lock"],
+                ),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues and graceful-termination interrupts
                 # are clean releases, not crashes — record a matching run
                 # outcome so the board history doesn't show a phantom crash
-                # for a quota wall or a deploy/restart.
-                if rate_limited_exit:
+                # for a quota wall or a deploy/restart. A plugin hard stop is
+                # likewise terminal-by-policy, not a crash: its run outcome is
+                # ``hard_stop`` and the task sits in ``blocked`` for a human
+                # rather than bouncing.
+                if hard_stop_exit:
+                    _run_outcome = "hard_stop"
+                elif rate_limited_exit:
                     _run_outcome = "rate_limited"
                 elif interrupted_exit:
                     _run_outcome = "interrupted"
@@ -7904,7 +7978,19 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload,
                     run_id=run_id,
                 )
-                if rate_limited_exit or interrupted_exit:
+                if hard_stop_exit:
+                    # Stamp the block reason + kind so the board shows WHY the
+                    # card is parked and a human sees it as a budget decision,
+                    # not a mystery crash. ``capability`` is the right kind:
+                    # the worker hit a hard wall it cannot clear on its own.
+                    # No ``consecutive_failures`` touch — the task is fine.
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = ?, "
+                        "block_kind = 'capability' WHERE id = ?",
+                        (error_text[:500], row["id"]),
+                    )
+                    hard_stopped.append(row["id"])
+                elif rate_limited_exit or interrupted_exit:
                     # No-fault release: stamp last_failure_error for board/
                     # operator visibility, but crucially do NOT touch
                     # ``consecutive_failures`` — a quota window (rate-limit) or
@@ -8054,6 +8140,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # e.g. a deploy/gateway restart) — also released without counting a
     # failure and kept out of the ``crashed`` return.
     detect_crashed_workers._last_interrupted = interrupted  # type: ignore[attr-defined]
+    # Same side-channel for plugin hard stops. These are already ``blocked``
+    # (terminal + sticky, awaiting a human budget decision), counted no
+    # failure, and must not appear in ``crashed`` — a respawn would just
+    # re-hit the cap.
+    detect_crashed_workers._last_hard_stopped = hard_stopped  # type: ignore[attr-defined]
     return crashed
 
 
@@ -8638,6 +8729,15 @@ def _dispatch_once_locked(
     )
     if _crash_interrupted:
         result.interrupted.extend(_crash_interrupted)
+    # Plugin hard stops (budget / circuit-breaker cap). Already routed to
+    # ``blocked`` with a sticky ``hard_stop`` event; surfaced here so
+    # telemetry and the dispatcher log show a budget wall as its own class
+    # rather than as a crash or a silent block.
+    _crash_hard_stopped = getattr(
+        detect_crashed_workers, "_last_hard_stopped", []
+    )
+    if _crash_hard_stopped:
+        result.hard_stopped.extend(_crash_hard_stopped)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
