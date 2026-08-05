@@ -305,6 +305,35 @@ def _(rid, params: dict) -> dict:
 
 @method("session.resume")
 def _(rid, params: dict) -> dict:
+    """Ownership wrapper around the resume handler.
+
+    ``session.resume`` mints a profile-scoped ``SessionDB`` for a non-launch
+    profile before it knows which of its several exits it will take. Only the
+    eager path hands that handle to a live session (which then owns it); the
+    lazy/watch and deferred-build paths return without ever giving it an owner,
+    and the deferred build re-mints its own handle anyway. Left unowned the
+    connection is never closed, so every sidebar chat-switch in the desktop app
+    permanently adds a ``state.db`` (+ ``-wal``/``-shm``) descriptor to the
+    backend process.
+
+    Close the handle on the way out unless the inner handler adopted it onto a
+    live session.
+    """
+    box: dict = {}
+    try:
+        return _session_resume(rid, params, box)
+    finally:
+        if not box.get("adopted"):
+            db = box.pop("db", None)
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    logger.debug("failed to close resume profile db", exc_info=True)
+
+
+@_registry.helper
+def _session_resume(rid, params: dict, _db_box: dict) -> dict:
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
@@ -321,12 +350,14 @@ def _(rid, params: dict) -> dict:
     # the caller explicitly requests it; other clients keep upstream behavior.
     omit_messages = is_truthy_value(params.get("omit_messages", False))
 
-    # In a profile scope, the agent OWNS a long-lived db handle bound to that
-    # profile (do NOT auto-close it here). Otherwise reuse the shared launch db.
+    # In a profile scope this handle is minted here and is NOT owned by anyone
+    # yet — record it in ``_db_box`` so the wrapper closes it on every exit
+    # that does not hand it to a live session (which sets ``adopted``).
     if profile_home is not None:
         from hermes_state import SessionDB
 
         db = SessionDB(db_path=profile_home / "state.db")
+        _db_box["db"] = db
     else:
         db = _get_db()
     if db is None:
@@ -679,6 +710,12 @@ def _(rid, params: dict) -> dict:
                     session_db=db,
                     source=source,
                 )
+                # The live session now owns the profile handle: teardown closes
+                # it, and the wrapper must not close it out from under a
+                # running session.
+                if profile_home is not None:
+                    _adopt_owned_session_db(_sessions.get(sid), db)
+                    _db_box["adopted"] = True
             finally:
                 if init_home_token is not None:
                     reset_hermes_home_override(init_home_token)
@@ -2671,6 +2708,7 @@ def _(rid, params: dict) -> dict:
             if lease is not None:
                 lease.release()
             return _err(rid, 5008, f"branch failed: {e}")
+    branch_db = None
     try:
         # Bind the branched AGENT to the parent's profile, mirroring
         # session.create/resume: home override so config/skills/memory resolve
@@ -2680,7 +2718,6 @@ def _(rid, params: dict) -> dict:
         # parent's db while the agent stayed on the launch handle would
         # recreate the cross-profile split one turn later.
         parent_home = session.get("profile_home")
-        branch_db = None
         if parent_home:
             from hermes_state import SessionDB
 
@@ -2721,6 +2758,10 @@ def _(rid, params: dict) -> dict:
                 source=source,
                 profile_home=parent_home,
             )
+            # The branch session owns the handle minted above; without this the
+            # connection outlives the branch and leaks a state.db descriptor.
+            if branch_db is not None:
+                _adopt_owned_session_db(_sessions.get(new_sid), branch_db)
         finally:
             if secret_token is not None:
                 reset_secret_scope(secret_token)
@@ -2731,6 +2772,13 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         if lease is not None:
             lease.release()
+        # The branch handle never reached a live session on this path, so
+        # nothing else will ever close it.
+        if branch_db is not None and _sessions.get(new_sid) is None:
+            try:
+                branch_db.close()
+            except Exception:
+                logger.debug("failed to close orphaned branch db", exc_info=True)
         return _err(rid, 5000, f"agent init failed on branch: {e}")
     branched_session = _sessions.get(new_sid)
     return _ok(

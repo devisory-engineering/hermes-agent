@@ -23,6 +23,7 @@ class HandlerRegistry:
 
     def __init__(self) -> None:
         self._pending: list[tuple[str, types.FunctionType]] = []
+        self._helpers: list[types.FunctionType] = []
 
     def method(self, name: str):
         """Drop-in for server.py's ``@method`` decorator (defers registration)."""
@@ -38,9 +39,31 @@ class HandlerRegistry:
         fn._hermes_profile_scoped = True
         return fn
 
+    def helper(self, fn):
+        """Register a module-level helper for the same globals rebinding.
+
+        For non-handler functions a ``@method`` handler calls by NAME (e.g. the
+        ``session.resume`` ownership split: the thin registered wrapper calls
+        ``_session_resume``). The handler executes against server.py's
+        namespace after ``install()``, so the callee must exist THERE with
+        server-rebound globals too — a plain module function in a ``methods_*``
+        module would resolve its own body's names against that module's (empty)
+        namespace and NameError at first use.
+        """
+        self._helpers.append(fn)
+        return fn
+
     def install(self, server) -> None:
         """Rebind pending handlers onto ``server``'s globals and register them."""
         g = vars(server)
+        for fn in self._helpers:
+            real = types.FunctionType(
+                fn.__code__, g, fn.__name__, fn.__defaults__, fn.__closure__
+            )
+            real.__kwdefaults__ = fn.__kwdefaults__
+            real.__doc__ = fn.__doc__
+            real.__dict__.update(fn.__dict__)
+            g[fn.__name__] = real
         for name, fn in self._pending:
             real = types.FunctionType(
                 fn.__code__, g, fn.__name__, fn.__defaults__, fn.__closure__
