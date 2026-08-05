@@ -639,6 +639,54 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def _isolated_provider_config_gate(request: Request, call_next):
+    """Deny-by-default gate over the provider/credential config surface on an
+    --isolated (per-owner) dashboard.
+
+    Model/provider selection and credentials are a PLATFORM decision on an
+    isolated dashboard. 0017 originally gated this by enumerating the specific
+    route names to refuse. Enumerating routes to gate has failed silently three
+    times on this platform — the /api/files/* bypass, the Slack allowed-channels
+    allowlist, and the no-iac tag — because upstream keeps growing a *parallel*
+    route in the same family that the enumeration never named, so it ships open.
+    The July 2026 delta did it again: ``/api/providers/custom-endpoints/{id}/
+    activate`` writes ``cfg["model"]`` (a model-selection write) and the GET
+    leaks provider/base_url — none of which 0017's enumerated guard covered.
+
+    Invert it: refuse the WHOLE provider/credential family by prefix, so a new
+    upstream route in these families is denied on arrival rather than shipping
+    ungated. The reads an isolated dashboard legitimately needs (chat-header
+    model info, Config, analytics) are model-SCRUBBED per-handler and live under
+    /api/model, /api/config, /api/analytics — NOT under these prefixes — so they
+    are unaffected. Nothing under /api/providers or /api/credentials is a
+    legitimate isolated-dashboard read: the whole surface is provider/model
+    identity, credentials, or a config mutation.
+
+    Registered BEFORE the auth middlewares (executes AFTER them), exactly like
+    ``_plugin_api_runtime_gate``: an unauthenticated caller must get auth's 401
+    first, so this can never be used to fingerprint routes. A no-op on the
+    machine (non-isolated) dashboard, where full model administration is intended.
+    """
+    if _model_control_hidden() and _isolated_config_surface_denied(
+        request.method, request.url.path
+    ):
+        _authed = (
+            getattr(request.state, "token_authenticated", False)
+            or getattr(request.app.state, "auth_required", False)
+            or _has_valid_session_token(request)
+            or _has_valid_query_token(request, request.url.path)
+        )
+        if _authed:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": "Provider and model configuration is managed by the platform.",
+                },
+            )
+    return await call_next(request)
+
+
 # ---------------------------------------------------------------------------
 # Dashboard OAuth auth gate — engaged only when start_server flags the
 # bind as non-loopback-without-insecure.  No-op pass-through in loopback
@@ -6256,6 +6304,7 @@ async def update_memory_provider_config(
 async def get_config(profile: Optional[str] = None):
     with _profile_scope(profile):
         config = _normalize_config_for_web(load_config())
+    config = _scrub_model_config_keys(config)
     # Strip internal keys that the frontend shouldn't see or send back
     return {k: v for k, v in config.items() if not k.startswith("_")}
 
@@ -6276,8 +6325,28 @@ async def get_schema(profile: Optional[str] = None):
 
 
 @app.get("/api/egress/status")
-async def get_egress_status():
-    """Dashboard/Desktop-readable egress proxy status and remediation text."""
+async def get_egress_status(request: Request):
+    """Dashboard/Desktop-readable egress proxy status and remediation text.
+
+    Upstream shipped this route with NO auth call at all, and its payload is a
+    provider/upstream identity dump: ``format_status_text`` lists every mapped
+    credential env name, the upstream hosts each one may reach, a redacted
+    token per mapping, and the "uncovered providers" whose real keys are still
+    visible in the sandbox. That is exactly what 0017 exists to hide.
+
+    Two gates, matching the rest of this patch:
+
+    * ``_require_token`` — the same explicit gate ``/api/ssh/ownership`` uses,
+      so the route is never reachable unauthenticated on any bind mode.
+    * model-identity scrub — on an isolated (per-owner) dashboard the whole
+      ``/api/egress/`` family is ALSO refused by ``_isolated_provider_config_gate``
+      (deny-by-default, see ``_ISOLATED_DENY_PREFIXES``). This per-handler scrub
+      is defense in depth for the case where middleware order ever changes: it
+      returns a neutral notice instead of the provider dump.
+    """
+    _require_token(request)
+    if _model_control_hidden():
+        return {"text": _EGRESS_STATUS_PLATFORM_NOTICE}
     from hermes_cli.proxy_cli import format_status_text
 
     return {"text": format_status_text()}
@@ -6301,6 +6370,8 @@ def get_model_info(profile: Optional[str] = None):
     frontend can display "Auto-detected: 200K" alongside the override field.
     Also returns model capabilities (vision, reasoning, tools) when available.
     """
+    if _model_control_hidden():
+        return dict(_EMPTY_MODEL_INFO)
     try:
         with _profile_scope(profile):
             cfg = load_config()
@@ -6420,6 +6491,7 @@ async def get_model_options(
     re-fetches its live catalog — used by the picker's explicit "Refresh
     Models" control. Normal opens leave it false to stay on the 1h cache.
     """
+    _assert_model_control_allowed()
     try:
         from hermes_cli.inventory import build_model_options_payload, load_picker_context
 
@@ -6457,6 +6529,7 @@ def get_recommended_default_model(provider: str = ""):
     where free_tier is True/False for Nous and None otherwise. `model` may be
     empty if nothing could be resolved (caller degrades gracefully).
     """
+    _assert_model_control_allowed()
     slug = (provider or "").strip().lower()
 
     if slug == "nous":
@@ -6537,6 +6610,7 @@ def get_auxiliary_models(profile: Optional[str] = None):
     the dashboard profile's auxiliary pins while /api/model/set wrote the
     selected profile's (read/write asymmetry).
     """
+    _assert_model_control_allowed()
     try:
         with _profile_scope(profile):
             cfg = load_config()
@@ -6574,6 +6648,7 @@ def get_auxiliary_models(profile: Optional[str] = None):
 @app.get("/api/model/moa")
 def get_moa_models(profile: Optional[str] = None):
     """Return the configured Mixture-of-Agents provider/model slots."""
+    _assert_model_control_allowed()
     try:
         from hermes_cli.moa_config import normalize_moa_config
 
@@ -6590,6 +6665,7 @@ def get_moa_models(profile: Optional[str] = None):
 @app.put("/api/model/moa")
 def set_moa_models(body: MoaConfigPayload, profile: Optional[str] = None):
     """Persist the Mixture-of-Agents provider/model slots."""
+    _assert_model_control_allowed()
     try:
         from hermes_cli.moa_config import normalize_moa_config, validate_moa_payload
 
@@ -6669,6 +6745,7 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
     The currently running chat PTY (if any) is not affected; use the
     ``/model`` slash command inside a chat to hot-swap that specific session.
     """
+    _assert_model_control_allowed()
     scope = (body.scope or "").strip().lower()
     provider = (body.provider or "").strip()
     model = (body.model or "").strip()
@@ -7041,6 +7118,7 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.put("/api/config")
 async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
+    _assert_no_model_config_write(body.config)
     try:
         with _profile_scope(body.profile or profile):
             # The dashboard form is schema-driven (see CONFIG_SCHEMA). Any root
@@ -12728,6 +12806,7 @@ def _pool_entry_summary(entry: Any, index: int) -> Dict[str, Any]:
 
 @app.get("/api/credentials/pool")
 async def list_credential_pool():
+    _assert_credentials_allowed()
     from agent.credential_pool import load_pool
     from hermes_cli.auth import read_credential_pool
 
@@ -12755,6 +12834,7 @@ async def list_credential_pool():
 
 @app.post("/api/credentials/pool")
 async def add_credential_pool_entry(body: CredentialPoolAdd):
+    _assert_credentials_allowed()
     import uuid as _uuid
     from agent.credential_pool import (
         load_pool,
@@ -12818,6 +12898,7 @@ async def remove_credential_pool_entry(provider: str, index: int):
     it.  Manual entries have no registered step — nothing external to clean,
     no suppression needed (they aren't re-seeded).
     """
+    _assert_credentials_allowed()
     from agent.credential_pool import load_pool
     from agent.credential_sources import find_removal_step
     from hermes_cli.auth import suppress_credential_source
@@ -13473,12 +13554,16 @@ def _profile_attr(info, name: str, default: Any = None) -> Any:
 
 
 def _profile_to_dict(info) -> Dict[str, Any]:
+    # 0017: profile records name the model/provider each profile runs on.
+    # Blanked (shape kept) on an isolated dashboard — this is the shared
+    # chokepoint for GET /api/profiles' live path and _fallback_profile_dicts.
+    _hide_model = _model_control_hidden()
     return {
         "name": _profile_attr(info, "name", ""),
         "path": str(_profile_attr(info, "path", "")),
         "is_default": bool(_profile_attr(info, "is_default", False)),
-        "model": _profile_attr(info, "model"),
-        "provider": _profile_attr(info, "provider"),
+        "model": None if _hide_model else _profile_attr(info, "model"),
+        "provider": None if _hide_model else _profile_attr(info, "provider"),
         "has_env": bool(_profile_attr(info, "has_env", False)),
         "skill_count": int(_profile_attr(info, "skill_count", 0) or 0),
         "gateway_running": bool(_profile_attr(info, "gateway_running", False)),
@@ -13548,6 +13633,127 @@ def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
 def _isolated_profile() -> str:
     """The profile this server is locked to, or "" for the machine dashboard."""
     return getattr(app.state, "isolated_profile", "") or ""
+
+
+# --- Owner-dashboard model gating -----------------------------------------
+# On an --isolated (per-owner) dashboard the model is a platform decision and
+# its identity must not leak: refuse every model-selection write and the
+# provider-credential surface, and scrub model identity from the reads that
+# would otherwise expose provider/model names (chat header, Models picker,
+# Config). All no-ops on the machine (non-isolated) dashboard, where full
+# model administration is intended.
+_MODEL_CONFIG_KEYS = frozenset(
+    {"model", "fallback_providers", "delegation", "providers", "auxiliary", "moa"}
+)
+
+# Served in place of the egress/iron-proxy status dump on an isolated
+# dashboard. Says the surface exists and is administered elsewhere; names no
+# provider, host, credential, or model.
+_EGRESS_STATUS_PLATFORM_NOTICE = (
+    "Egress proxy status is managed by the platform."
+)
+
+# Deny-by-default families for the isolated-dashboard provider/config gate
+# (see _isolated_provider_config_gate middleware). Every route under these
+# prefixes is refused on an isolated dashboard — provider identity, custom
+# endpoints (list/create/activate/delete/validate), provider OAuth, and the
+# credential pool are all platform-managed. Refusing by PREFIX (not by
+# enumerated route name) means a new upstream route in the family is denied on
+# arrival instead of shipping ungated.
+_ISOLATED_DENY_PREFIXES = (
+    "/api/providers/",    # provider identity + custom endpoints + provider OAuth
+    "/api/credentials/",  # provider credential pool
+    # Egress/iron-proxy status. ``format_status_text`` enumerates mapped
+    # credential env names, their allowed upstream hosts, redacted tokens, and
+    # the uncovered-provider list — provider/upstream identity by any reading.
+    # Added with the /api/egress/status route itself (upstream shipped it
+    # ungated); the family, not the one route, so the next endpoint upstream
+    # hangs off /api/egress/ is denied on arrival.
+    "/api/egress/",
+)
+# Exact config-mutating routes outside the deny prefixes that must also be
+# refused on an isolated dashboard. ``/api/tools/terminal/backend`` (PUT)
+# selects WHERE agent shell commands execute (pre-audit §6c) — a platform
+# decision. Kept as an explicit (method, path) set so read siblings under the
+# same path (e.g. GET /api/tools/terminal/backends) stay available.
+_ISOLATED_DENY_EXACT = frozenset(
+    {
+        ("PUT", "/api/tools/terminal/backend"),
+    }
+)
+
+
+def _isolated_config_surface_denied(method: str, path: str) -> bool:
+    """True when (method, path) is a provider/credential/config-mutation route
+    that a platform-managed (isolated) dashboard must never reach.
+
+    Deny-by-default over whole route families by prefix, plus a small explicit
+    (method, path) set for config-mutating routes that live outside those
+    prefixes. The caller (_isolated_provider_config_gate) only consults this on
+    an isolated dashboard.
+    """
+    for prefix in _ISOLATED_DENY_PREFIXES:
+        # Match the family root (e.g. exactly "/api/providers") and everything
+        # beneath it.
+        if path == prefix.rstrip("/") or path.startswith(prefix):
+            return True
+    return (method.upper(), path) in _ISOLATED_DENY_EXACT
+
+
+def _model_control_hidden() -> bool:
+    """True when this dashboard must hide/refuse model selection + identity."""
+    return bool(_isolated_profile())
+
+
+def _assert_model_control_allowed() -> None:
+    if _model_control_hidden():
+        raise HTTPException(
+            status_code=403,
+            detail="Model selection is managed by the platform.",
+        )
+
+
+def _assert_credentials_allowed() -> None:
+    if _model_control_hidden():
+        raise HTTPException(
+            status_code=403,
+            detail="Provider credentials are managed by the platform.",
+        )
+
+
+def _assert_no_model_config_write(cfg) -> None:
+    """403 if an isolated dashboard tries to write any model-identity key."""
+    if _model_control_hidden() and isinstance(cfg, dict):
+        if any(key in cfg for key in _MODEL_CONFIG_KEYS):
+            raise HTTPException(
+                status_code=403,
+                detail="Model configuration is managed by the platform.",
+            )
+
+
+def _scrub_model_config_keys(cfg):
+    """Drop model-identity keys from a config mapping when gated."""
+    if _model_control_hidden() and isinstance(cfg, dict):
+        return {k: v for k, v in cfg.items() if k not in _MODEL_CONFIG_KEYS}
+    return cfg
+
+
+def _scrub_model_config_yaml(text: str) -> str:
+    """Strip model-identity keys from raw config YAML when gated.
+
+    Best-effort: if the document does not parse, return a neutral placeholder
+    rather than risk leaking identity via the raw text.
+    """
+    if not _model_control_hidden():
+        return text
+    try:
+        parsed = yaml.safe_load(text)
+    except Exception:
+        return "# Model configuration is managed by the platform.\n"
+    if not isinstance(parsed, dict):
+        return text
+    stripped = {k: v for k, v in parsed.items() if k not in _MODEL_CONFIG_KEYS}
+    return yaml.safe_dump(stripped, default_flow_style=False, sort_keys=False)
 
 
 def _assert_profile_allowed(name: str) -> None:
@@ -14194,7 +14400,8 @@ async def get_config_raw(profile: Optional[str] = None):
         path = get_config_path()
     if not path.exists():
         return {"yaml": "", "path": str(path)}
-    return {"yaml": path.read_text(encoding="utf-8"), "path": str(path)}
+    _raw = _scrub_model_config_yaml(path.read_text(encoding="utf-8"))
+    return {"yaml": _raw, "path": str(path)}
 
 
 @app.put("/api/config/raw")
@@ -14203,6 +14410,7 @@ async def update_config_raw(body: RawConfigUpdate, profile: Optional[str] = None
         parsed = yaml.safe_load(body.yaml_text)
         if not isinstance(parsed, dict):
             raise HTTPException(status_code=400, detail="YAML must be a mapping")
+        _assert_no_model_config_write(parsed)
         with _profile_scope(body.profile or profile):
             # Full-document replacement: the editor owns the whole file; do not
             # merge omitted sections back from disk (#62723).
@@ -14358,6 +14566,9 @@ def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
             GROUP BY model ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
         """, (cutoff,))
         by_model = [dict(r) for r in cur2.fetchall()]
+        if _model_control_hidden():
+            for _row in by_model:
+                _row["model"] = ""
 
         # Fold in auxiliary usage (vision, compression, title_generation, ...)
         # recorded per (model, task) in session_model_usage. Aux calls never
@@ -14416,6 +14627,7 @@ def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
     Returns token/cost/session breakdown per model plus capability metadata
     from models.dev (context window, vision, tools, reasoning, etc.).
     """
+    _assert_model_control_allowed()
     db = _open_session_db_for_profile(profile, read_only=True)
     try:
         cutoff = time.time() - (days * 86400)
@@ -16336,6 +16548,17 @@ def mount_spa(application: FastAPI):
         theme_bootstrap = _render_active_theme_bootstrap_css()
         if theme_bootstrap:
             html = html.replace("</head>", f"{theme_bootstrap}</head>", 1)
+        if _model_control_hidden():
+            _notice = (
+                '<div style="position:fixed;left:0;right:0;bottom:0;'
+                'z-index:2147483647;padding:4px 10px;text-align:center;'
+                'font:12px/1.4 system-ui,-apple-system,sans-serif;color:#b9a94a;'
+                'background:rgba(28,28,20,.94);'
+                'border-top:1px solid rgba(185,169,74,.4);pointer-events:none;">'
+                'Model is managed by the platform \u00b7 A/B/C evaluations may be active'
+                '</div>'
+            )
+            html = html.replace("</body>", f"{_notice}</body>", 1)
         html = html.replace("</head>", f"{bootstrap_script}</head>", 1)
         return HTMLResponse(
             html,
