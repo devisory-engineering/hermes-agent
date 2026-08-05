@@ -94,6 +94,70 @@ def _ws_upgrade_authorized(ws: "WebSocket") -> bool:
     return bool(_ws._ws_auth_ok(ws))
 
 
+# ---------------------------------------------------------------------------
+# Owner-dashboard model gating (patch 0017) — per-task model/provider override
+# ---------------------------------------------------------------------------
+# Upstream ``c1b0f6f3c`` added a per-task ``model_override`` / ``provider_override``
+# column (kanban_db ``_migrate_add_optional_columns``) plus a board dropdown that
+# reads and writes it through these routes. On an --isolated (per-owner)
+# dashboard that is a NEW model-identity surface: the read leaks which model a
+# card runs on, and the write is a model-selection write — both of which 0017
+# refuses everywhere else. The kanban board itself is a legitimate isolated-
+# dashboard surface, so it cannot be denied wholesale by
+# ``_isolated_provider_config_gate``; gate the two override fields instead —
+# scrub them out of every task read, refuse them on every task write.
+# ---------------------------------------------------------------------------
+
+#: Task fields that carry model identity. Scrubbed from every serialized task.
+# ``reasoning_effort`` joined in the 0.20 picker (97971643a): it is a third
+# model-identity axis — an effort level names the model's reasoning tier and
+# rides the same per-task picker — so it is scrubbed and refused with the
+# other two.
+_MODEL_OVERRIDE_TASK_KEYS = ("model_override", "provider_override", "reasoning_effort")
+
+
+def _model_control_hidden() -> bool:
+    """True when this dashboard must hide/refuse model selection + identity.
+
+    Delegates to the core dashboard's gate (``web_server._model_control_hidden``)
+    rather than re-reading ``app.state.isolated_profile`` here, so the plugin can
+    never drift from the core policy. Mirrors ``_ws_upgrade_authorized`` above:
+    with no dashboard context (a unit test importing this router standalone)
+    there is no isolated profile and nothing to hide, so report False.
+    """
+    try:
+        from hermes_cli import web_server as _ws
+
+        return bool(_ws._model_control_hidden())
+    except Exception:
+        return False
+
+
+def _assert_no_model_override(payload: Any) -> None:
+    """403 when an isolated dashboard tries to pin/clear a per-task model.
+
+    Covers create, patch, and bulk — every route whose body carries the
+    override fields. ``clear_model_override`` is refused too: clearing leaks
+    nothing, but it is still a model-selection write, and 0017's rule is that
+    model choice is a platform decision on an isolated dashboard, not an owner
+    one. The message matches ``_assert_model_control_allowed`` so the SPA shows
+    one consistent notice.
+    """
+    if not _model_control_hidden():
+        return
+    if (
+        getattr(payload, "model_override", None) is not None
+        or getattr(payload, "provider_override", None) is not None
+        or getattr(payload, "clear_model_override", False)
+        or getattr(payload, "reasoning_effort", None) is not None
+        or getattr(payload, "clear_reasoning_effort", False)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Model selection is managed by the platform.",
+        )
+
+
 def _resolve_board(board: Optional[str]) -> Optional[str]:
     """Validate and normalise a board slug from a query param.
 
@@ -161,6 +225,14 @@ def _task_dict(
     latest_summary: Optional[str] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
+    # Model identity never reaches an isolated (per-owner) dashboard — see
+    # _MODEL_OVERRIDE_TASK_KEYS. Every task read on this plugin funnels through
+    # here (list, detail, create, patch, bulk), so scrubbing once covers them
+    # all; the board's model dropdown then renders "unset" instead of naming
+    # the pinned model/provider.
+    if _model_control_hidden():
+        for _key in _MODEL_OVERRIDE_TASK_KEYS:
+            d.pop(_key, None)
     # Add derived age metrics so the UI can colour stale cards without
     # computing deltas client-side.
     try:
@@ -620,6 +692,7 @@ class CreateTaskBody(BaseModel):
 
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
+    _assert_no_model_override(payload)
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -853,6 +926,7 @@ class UpdateTaskBody(BaseModel):
 
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
+    _assert_no_model_override(payload)
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -1234,6 +1308,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
     This is an *independent* iteration — per-task failures don't abort
     siblings. Returns per-id outcome so the UI can surface partials.
     """
+    _assert_no_model_override(payload)
     ids = [i for i in (payload.ids or []) if i]
     if not ids:
         raise HTTPException(status_code=400, detail="ids is required")
@@ -1586,7 +1661,10 @@ def inspect_run_endpoint(
             "num_fds": num_fds,
             "status": info.get("status"),
             "create_time": info.get("create_time"),
-            "cmdline": info.get("cmdline"),
+            # 0017: a dispatched worker's argv literally spells
+            # ``-m <model> --provider <p> --reasoning <level>``
+            # (kanban_db._default_spawn) — hidden on an isolated dashboard.
+            "cmdline": None if _model_control_hidden() else info.get("cmdline"),
         }
     except _psutil.NoSuchProcess:
         return {"run_id": run_id, "alive": False, "pid": pid, "reason": "process not found"}
@@ -1901,7 +1979,9 @@ def _run_estimate(title: str, body: Optional[str]) -> dict:
         "est_tokens": est_tokens,
         "complexity": complexity,
         "rationale": rationale,
-        "model": model,
+        # 0017: the auxiliary model that produced the estimate is still model
+        # identity — blanked on an isolated dashboard.
+        "model": "" if _model_control_hidden() else model,
     }
 
 
@@ -2210,6 +2290,14 @@ def model_options():
     custom-provider probes: the dropdown needs names fast, not $/Mtok
     columns (a slow/offline local endpoint must not hang the drawer).
     """
+    # 0017: the catalog is the whole authenticated provider + model roster —
+    # /api/model/options re-exposed under the plugin prefix, where the core
+    # deny-prefix middleware cannot see it. On an isolated dashboard return the
+    # same empty shape the exception path degrades to (the UI already handles
+    # it); a 403 here would break the drawer for a surface the viewer cannot
+    # use anyway.
+    if _model_control_hidden():
+        return {"providers": []}
     try:
         from hermes_cli.inventory import build_models_payload, load_picker_context
 
@@ -2539,8 +2627,11 @@ def list_profile_roster():
             {
                 "name": p.name,
                 "is_default": bool(p.is_default),
-                "model": p.model or "",
-                "provider": p.provider or "",
+                # 0017: profile records carry the model/provider each profile
+                # runs on — blanked on an isolated dashboard (the roster shape
+                # is kept so the orchestrator picker still lists names).
+                "model": "" if _model_control_hidden() else (p.model or ""),
+                "provider": "" if _model_control_hidden() else (p.provider or ""),
                 "description": p.description or "",
                 "description_auto": bool(p.description_auto),
                 "skill_count": int(p.skill_count or 0),
@@ -2827,6 +2918,13 @@ async def stream_events(ws: WebSocket):
                         payload = json.loads(r["payload"]) if r["payload"] else None
                     except Exception:
                         payload = None
+                    # 0017: task_events payloads are raw JSON with no other
+                    # serialization chokepoint — ``model_override_set`` /
+                    # ``reasoning_effort_set`` events carry the exact fields
+                    # ``_task_dict`` scrubs, so scrub them here too.
+                    if payload and _model_control_hidden():
+                        for _key in _MODEL_OVERRIDE_TASK_KEYS:
+                            payload.pop(_key, None)
                     out.append({
                         "id": r["id"],
                         "task_id": r["task_id"],

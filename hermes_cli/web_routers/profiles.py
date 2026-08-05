@@ -41,6 +41,7 @@ router = APIRouter()
 
 # Late-bound web_server helpers (resolved at call time; cycle-safe,
 # monkeypatch-transparent).
+_assert_model_control_allowed = late("_assert_model_control_allowed")
 _cron_profile_home = late("_cron_profile_home")
 _disable_unselected_skills = late("_disable_unselected_skills")
 _fallback_profile_dicts = late("_fallback_profile_dicts")
@@ -373,6 +374,11 @@ async def list_profiles_endpoint():
 @router.post("/api/profiles")
 async def create_profile_endpoint(body: ProfileCreate):
     from hermes_cli import profiles as profiles_mod
+    # 0017: the create body accepts provider/model — a model-selection write
+    # outside every /api/model/* gate. Refuse it (only when actually set, so a
+    # plain create still works) on an isolated dashboard.
+    if (body.provider or "").strip() or (body.model or "").strip():
+        _assert_model_control_allowed()
     explicit_source = (body.clone_from or "").strip()
     if explicit_source:
         # Duplicating a specific profile: clone its config/skills/SOUL (or full
@@ -679,6 +685,7 @@ async def update_profile_model_endpoint(name: str, body: ProfileModelUpdate):
     active profile. Mirrors ``POST /api/model/set`` (main scope) but scoped
     to the named profile via the HERMES_HOME override.
     """
+    _assert_model_control_allowed()
     profile_dir = _resolve_profile_dir(name)
     provider = (body.provider or "").strip()
     model = (body.model or "").strip()
