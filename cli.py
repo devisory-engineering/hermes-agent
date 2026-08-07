@@ -18295,6 +18295,12 @@ def main(
         # agent must wait the full MCP cold-start bound before its first
         # (and only) tool snapshot. See #51316.
         cli._single_query_mode = True
+        try:
+            from tools.kanban_docker_bridge import ensure_kanban_docker_worker_ready
+            ensure_kanban_docker_worker_ready()
+        except RuntimeError as _kdb_err:
+            print("error: %s" % (_kdb_err,), file=sys.stderr)
+            sys.exit(2)
         if not cli._claim_active_session("cli", stderr=bool(quiet)):
             sys.exit(1)
         try:

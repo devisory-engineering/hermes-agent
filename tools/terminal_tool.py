@@ -1532,7 +1532,7 @@ def _get_env_config() -> Dict[str, Any]:
                         cwd, env_type, default_cwd)
             cwd = default_cwd
 
-    return {
+    config = {
         "env_type": env_type,
         "modal_mode": coerce_modal_mode(os.getenv("TERMINAL_MODAL_MODE", "auto")),
         "docker_image": os.getenv("TERMINAL_DOCKER_IMAGE", default_image),
@@ -1588,6 +1588,14 @@ def _get_env_config() -> Dict[str, Any]:
             "TERMINAL_DOCKER_ORPHAN_REAPER", "true"
         ).lower() in {"true", "1", "yes"},
     }
+    try:
+        from tools.kanban_docker_bridge import apply_kanban_docker_bridge
+        apply_kanban_docker_bridge(config)
+    except RuntimeError:
+        raise
+    except Exception as _bridge_exc:  # noqa: BLE001
+        logger.debug("kanban docker bridge skipped: %s", _bridge_exc)
+    return config
 
 
 def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:
@@ -1650,6 +1658,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             volumes=volumes,
             host_cwd=host_cwd,
             auto_mount_cwd=cc.get("docker_mount_cwd_to_workspace", False),
+            require_workspace_mount=cc.get("require_workspace_mount", False),
             forward_env=docker_forward_env,
             env=docker_env,
             run_as_host_user=cc.get("docker_run_as_host_user", False),
@@ -2443,6 +2452,7 @@ def terminal_tool(
                                 "vercel_runtime": config.get("vercel_runtime", ""),
                                 "docker_volumes": config.get("docker_volumes", []),
                                 "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
+                                "require_workspace_mount": config.get("require_workspace_mount", False),
                                 "docker_forward_env": config.get("docker_forward_env", []),
                                 "docker_env": config.get("docker_env", {}),
                                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),

@@ -866,6 +866,7 @@ class DockerEnvironment(BaseEnvironment):
         network: bool = True,
         host_cwd: str = None,
         auto_mount_cwd: bool = False,
+        require_workspace_mount: bool = False,
         run_as_host_user: bool = False,
         extra_args: list = None,
         persist_across_processes: bool = True,
@@ -879,6 +880,7 @@ class DockerEnvironment(BaseEnvironment):
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
+        self._require_workspace_mount = bool(require_workspace_mount)
         self._init_unset_passthrough_names: tuple[str, ...] = ()
         # Snap/cwd artifacts must land on a container-writable path. The
         # container runs as a non-root user (image 'agent' or host hermes)
@@ -962,7 +964,10 @@ class DockerEnvironment(BaseEnvironment):
             and not workspace_explicitly_mounted
         )
         if auto_mount_cwd and host_cwd and not os.path.isdir(host_cwd_abs):
-            logger.debug("Skipping docker cwd mount: host_cwd is not a valid directory: %s", host_cwd)
+            msg = "host_cwd is not a valid directory: %s" % (host_cwd,)
+            if self._require_workspace_mount:
+                raise RuntimeError("Kanban docker worker requires workspace mount but " + msg)
+            logger.debug("Skipping docker cwd mount: %s", msg)
 
         self._workspace_dir: Optional[str] = None
         self._home_dir: Optional[str] = None
@@ -995,6 +1000,12 @@ class DockerEnvironment(BaseEnvironment):
             volume_args = ["-v", f"{host_cwd_abs}:/workspace", *volume_args]
         elif workspace_explicitly_mounted:
             logger.debug("Skipping docker cwd mount: /workspace already mounted by user config")
+        elif self._require_workspace_mount:
+            raise RuntimeError(
+                "Kanban docker worker requires the claimed workspace mounted at "
+                "/workspace but no bind mount was established "
+                "(host_cwd=%r, auto_mount_cwd=%r)." % (host_cwd, auto_mount_cwd)
+            )
 
         # Mount credential files (OAuth tokens, etc.) declared by skills.
         # Read-only so the container can authenticate but not modify host creds.
