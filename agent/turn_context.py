@@ -41,6 +41,7 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
+from agent.memory_provider import is_trivial_prompt
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
@@ -81,7 +82,18 @@ def compose_user_api_content(
         injections.append(plugin_user_context)
     if not injections:
         return None
-    return content + "\n\n" + "\n\n".join(injections)
+    # Keep ephemeral recalled context (memory prefetch + plugin injections)
+    # BEFORE the live user instruction so the user-authored request remains the
+    # final authority. Recalled memory is untrusted historical observation
+    # (see build_memory_context_block's system note); placing it LAST would put
+    # promptware-poisoned memory in the position a model weights as the
+    # operative trailing instruction. This is 0008's untrusted-recall ordering
+    # boundary. Because this helper is the single composition source — the
+    # prologue stamps its output as the api_content sidecar and the
+    # api_messages build replays that same sidecar — the memory-before-request
+    # order holds on every pass and the prompt-cache byte-stability invariant
+    # (turn N's bytes == turn N+1's replay) is preserved.
+    return "\n\n".join((*injections, content))
 
 
 def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
@@ -1152,11 +1164,15 @@ def build_turn_context(
             pass
 
     # External memory provider: prefetch once before the tool loop.
+    #
+    # Skip prefetch on trivial prompts (greetings, acknowledgements) to
+    # prevent memory-context injection on turns that carry no semantic signal.
     ext_prefetch_cache = ""
     if agent._memory_manager:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
-            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+            if not is_trivial_prompt(_query):
+                ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
         except Exception:
             pass
 

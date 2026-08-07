@@ -339,6 +339,28 @@ async def gated_auth_middleware(
     if getattr(request.state, "token_authenticated", False):
         return await call_next(request)
 
+    # Headless-client credential (Hermes Desktop remote pairing): a per-backend
+    # token in the X-Hermes-Session-Token (or Bearer) header, verified against
+    # the session-token providers, stands in for a browser cookie session on
+    # EVERY non-public route. Consults only ``supports_session_token`` providers
+    # (never drain-style service credentials) and fails closed — an absent /
+    # wrong token returns None here and falls through to the cookie logic below
+    # (→ 401 / /login). No public/registered-route dependency: the Desktop app
+    # authenticates each request statelessly, so this must cover the whole
+    # surface, not a per-route opt-in.
+    from hermes_cli.dashboard_auth.token_auth import authenticate_session_token
+
+    principal, unreachable = authenticate_session_token(request)
+    if principal is not None:
+        request.state.token_principal = principal
+        request.state.token_authenticated = True
+        return await call_next(request)
+    if unreachable:
+        return JSONResponse(
+            {"detail": f"Auth provider {unreachable!r} unreachable"},
+            status_code=503,
+        )
+
     path = request.url.path
     if _path_is_public(path):
         return await call_next(request)

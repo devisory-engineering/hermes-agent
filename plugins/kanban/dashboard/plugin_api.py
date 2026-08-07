@@ -94,6 +94,70 @@ def _ws_upgrade_authorized(ws: "WebSocket") -> bool:
     return bool(_ws._ws_auth_ok(ws))
 
 
+# ---------------------------------------------------------------------------
+# Owner-dashboard model gating (patch 0017) — per-task model/provider override
+# ---------------------------------------------------------------------------
+# Upstream ``c1b0f6f3c`` added a per-task ``model_override`` / ``provider_override``
+# column (kanban_db ``_migrate_add_optional_columns``) plus a board dropdown that
+# reads and writes it through these routes. On an --isolated (per-owner)
+# dashboard that is a NEW model-identity surface: the read leaks which model a
+# card runs on, and the write is a model-selection write — both of which 0017
+# refuses everywhere else. The kanban board itself is a legitimate isolated-
+# dashboard surface, so it cannot be denied wholesale by
+# ``_isolated_provider_config_gate``; gate the two override fields instead —
+# scrub them out of every task read, refuse them on every task write.
+# ---------------------------------------------------------------------------
+
+#: Task fields that carry model identity. Scrubbed from every serialized task.
+# ``reasoning_effort`` joined in the 0.20 picker (97971643a): it is a third
+# model-identity axis — an effort level names the model's reasoning tier and
+# rides the same per-task picker — so it is scrubbed and refused with the
+# other two.
+_MODEL_OVERRIDE_TASK_KEYS = ("model_override", "provider_override", "reasoning_effort")
+
+
+def _model_control_hidden() -> bool:
+    """True when this dashboard must hide/refuse model selection + identity.
+
+    Delegates to the core dashboard's gate (``web_server._model_control_hidden``)
+    rather than re-reading ``app.state.isolated_profile`` here, so the plugin can
+    never drift from the core policy. Mirrors ``_ws_upgrade_authorized`` above:
+    with no dashboard context (a unit test importing this router standalone)
+    there is no isolated profile and nothing to hide, so report False.
+    """
+    try:
+        from hermes_cli import web_server as _ws
+
+        return bool(_ws._model_control_hidden())
+    except Exception:
+        return False
+
+
+def _assert_no_model_override(payload: Any) -> None:
+    """403 when an isolated dashboard tries to pin/clear a per-task model.
+
+    Covers create, patch, and bulk — every route whose body carries the
+    override fields. ``clear_model_override`` is refused too: clearing leaks
+    nothing, but it is still a model-selection write, and 0017's rule is that
+    model choice is a platform decision on an isolated dashboard, not an owner
+    one. The message matches ``_assert_model_control_allowed`` so the SPA shows
+    one consistent notice.
+    """
+    if not _model_control_hidden():
+        return
+    if (
+        getattr(payload, "model_override", None) is not None
+        or getattr(payload, "provider_override", None) is not None
+        or getattr(payload, "clear_model_override", False)
+        or getattr(payload, "reasoning_effort", None) is not None
+        or getattr(payload, "clear_reasoning_effort", False)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Model selection is managed by the platform.",
+        )
+
+
 def _resolve_board(board: Optional[str]) -> Optional[str]:
     """Validate and normalise a board slug from a query param.
 
@@ -161,6 +225,14 @@ def _task_dict(
     latest_summary: Optional[str] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
+    # Model identity never reaches an isolated (per-owner) dashboard — see
+    # _MODEL_OVERRIDE_TASK_KEYS. Every task read on this plugin funnels through
+    # here (list, detail, create, patch, bulk), so scrubbing once covers them
+    # all; the board's model dropdown then renders "unset" instead of naming
+    # the pinned model/provider.
+    if _model_control_hidden():
+        for _key in _MODEL_OVERRIDE_TASK_KEYS:
+            d.pop(_key, None)
     # Add derived age metrics so the UI can colour stale cards without
     # computing deltas client-side.
     try:
@@ -610,10 +682,17 @@ class CreateTaskBody(BaseModel):
     goal_max_turns: Optional[int] = None
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
+    # Per-task thinking depth (none|minimal|…|ultra). None = inherit the
+    # assigned profile's own agent.reasoning_effort.
+    reasoning_effort: Optional[str] = None
+    # Explicit project link; when omitted, create_task inherits the board's
+    # scoped project (if any) so a project-scoped board anchors every task.
+    project_id: Optional[str] = None
 
 
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
+    _assert_no_model_override(payload)
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -636,6 +715,9 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             goal_max_turns=payload.goal_max_turns,
             model_override=payload.model_override,
             provider_override=payload.provider_override,
+            reasoning_effort=payload.reasoning_effort,
+            project_id=payload.project_id,
+            board=board,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
@@ -834,10 +916,17 @@ class UpdateTaskBody(BaseModel):
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
     clear_model_override: bool = False
+    # Per-task thinking depth. ``"none"`` is a VALUE (thinking off), not a
+    # clear — use ``clear_reasoning_effort=True`` to fall back to the
+    # profile's own level. Separate from the model clear so dropping a model
+    # override doesn't silently reset the depth the operator chose.
+    reasoning_effort: Optional[str] = None
+    clear_reasoning_effort: bool = False
 
 
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
+    _assert_no_model_override(payload)
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -924,6 +1013,19 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     conn, task_id, new_model,
                     provider=payload.provider_override,
                 )
+            except (ValueError, RuntimeError) as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            if not ok:
+                raise HTTPException(status_code=404, detail="task not found")
+
+        # --- reasoning effort ----------------------------------------------
+        if payload.clear_reasoning_effort or payload.reasoning_effort is not None:
+            new_effort = (
+                None if payload.clear_reasoning_effort
+                else payload.reasoning_effort
+            )
+            try:
+                ok = kanban_db.set_reasoning_effort(conn, task_id, new_effort)
             except (ValueError, RuntimeError) as e:
                 raise HTTPException(status_code=400, detail=str(e))
             if not ok:
@@ -1194,6 +1296,9 @@ class BulkTaskBody(BaseModel):
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
     clear_model_override: bool = False
+    # Bulk thinking-depth override — same semantics as UpdateTaskBody.
+    reasoning_effort: Optional[str] = None
+    clear_reasoning_effort: bool = False
 
 
 @router.post("/tasks/bulk")
@@ -1203,6 +1308,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
     This is an *independent* iteration — per-task failures don't abort
     siblings. Returns per-id outcome so the UI can surface partials.
     """
+    _assert_no_model_override(payload)
     ids = [i for i in (payload.ids or []) if i]
     if not ids:
         raise HTTPException(status_code=400, detail="ids is required")
@@ -1297,6 +1403,17 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         )
                         if not ok:
                             entry.update(ok=False, error="model override refused")
+                    except (ValueError, RuntimeError) as e:
+                        entry.update(ok=False, error=str(e))
+                if payload.clear_reasoning_effort or payload.reasoning_effort is not None:
+                    new_effort = (
+                        None if payload.clear_reasoning_effort
+                        else payload.reasoning_effort
+                    )
+                    try:
+                        ok = kanban_db.set_reasoning_effort(conn, tid, new_effort)
+                        if not ok:
+                            entry.update(ok=False, error="reasoning override refused")
                     except (ValueError, RuntimeError) as e:
                         entry.update(ok=False, error=str(e))
             except Exception as e:  # defensive — one bad id shouldn't kill the batch
@@ -1544,7 +1661,10 @@ def inspect_run_endpoint(
             "num_fds": num_fds,
             "status": info.get("status"),
             "create_time": info.get("create_time"),
-            "cmdline": info.get("cmdline"),
+            # 0017: a dispatched worker's argv literally spells
+            # ``-m <model> --provider <p> --reasoning <level>``
+            # (kanban_db._default_spawn) — hidden on an isolated dashboard.
+            "cmdline": None if _model_control_hidden() else info.get("cmdline"),
         }
     except _psutil.NoSuchProcess:
         return {"run_id": run_id, "alive": False, "pid": pid, "reason": "process not found"}
@@ -1733,6 +1853,136 @@ def reassign_task_endpoint(
         return {"ok": True, "task_id": task_id, "assignee": payload.profile or None}
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Estimate — a rough token/complexity estimate for a task via the auxiliary
+# (auto-routed) model. NOT a dollar cost: providers don't report cost
+# reliably, so we estimate tokens + a complexity band with a one-line why.
+# ---------------------------------------------------------------------------
+
+_ESTIMATE_SYSTEM_PROMPT = (
+    "You estimate how much work an autonomous coding agent will spend on a "
+    "kanban task. Given the task title and description, respond with STRICT "
+    "JSON only (no prose, no code fence):\n"
+    '{"est_tokens": <integer total tokens across the whole run>, '
+    '"complexity": "S"|"M"|"L", '
+    '"rationale": "<one short sentence>"}\n'
+    "Base the token figure on a realistic multi-turn agent run (reading files, "
+    "tool calls, edits, retries) — not a single reply. S≈small/localized, "
+    "M≈multi-file, L≈broad or ambiguous. Be honest that this is a rough guess."
+)
+
+
+class EstimateBody(BaseModel):
+    title: str = ""
+    body: Optional[str] = None
+
+
+@router.post("/estimate")
+def estimate_text_endpoint(payload: EstimateBody):
+    """Estimate from raw title/body — used by the create dialog before a task
+    exists yet. Same outcome shape as the per-task endpoint below."""
+    return _run_estimate(payload.title, payload.body)
+
+
+@router.post("/tasks/{task_id}/estimate")
+def estimate_task_endpoint(task_id: str, board: Optional[str] = Query(None)):
+    """Rough token + complexity estimate for an existing task via the auxiliary
+    model. Returns ``{ok, est_tokens, complexity, rationale, model}``; a non-OK
+    outcome is NOT an HTTP error. Runs in FastAPI's threadpool (sync ``def``)
+    because the LLM call can take several seconds.
+    """
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+    finally:
+        conn.close()
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+    return _run_estimate(task.title, task.body)
+
+
+def _run_estimate(title: str, body: Optional[str]) -> dict:
+    """Shared estimate core: ask the auto-routed auxiliary model for a rough
+    token + complexity read on a task described by ``title``/``body``.
+
+    Never raises — a bad config / parse / API error becomes
+    ``{"ok": False, "reason": ...}`` so the UI can render it inline.
+    """
+    if not (title or "").strip():
+        return {"ok": False, "reason": "a title is required to estimate"}
+
+    try:
+        from agent.auxiliary_client import call_llm
+    except Exception:
+        return {"ok": False, "reason": "auxiliary client unavailable"}
+
+    def _cap(s: Optional[str], n: int) -> str:
+        s = (s or "").strip()
+        return s if len(s) <= n else s[:n] + "…"
+
+    user_msg = (
+        f"Title: {_cap(title, 400)}\n\n"
+        f"Description:\n{_cap(body, 4000) or '(none)'}"
+    )
+    try:
+        resp = call_llm(
+            task="kanban_estimator",
+            messages=[
+                {"role": "system", "content": _ESTIMATE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.0,
+            max_tokens=300,
+            timeout=60,
+        )
+    except Exception as exc:
+        return {"ok": False, "reason": f"LLM error: {type(exc).__name__}"}
+
+    try:
+        raw = (resp.choices[0].message.content or "").strip()
+        model = getattr(resp, "model", None)
+    except Exception:
+        raw, model = "", None
+
+    # Reuse the same tolerant JSON-blob extraction the specifier uses.
+    parsed: Optional[dict] = None
+    try:
+        import json as _json
+        import re as _re
+        blob = raw
+        if not blob.lstrip().startswith("{"):
+            m = _re.search(r"\{.*\}", blob, _re.DOTALL)
+            blob = m.group(0) if m else blob
+        obj = _json.loads(blob)
+        if isinstance(obj, dict):
+            parsed = obj
+    except Exception:
+        parsed = None
+
+    if not parsed:
+        return {"ok": False, "reason": "could not parse an estimate from the model"}
+
+    try:
+        est_tokens = int(parsed.get("est_tokens") or 0)
+    except (TypeError, ValueError):
+        est_tokens = 0
+    complexity = str(parsed.get("complexity") or "").strip().upper()
+    if complexity not in {"S", "M", "L"}:
+        complexity = None
+    rationale = str(parsed.get("rationale") or "").strip() or None
+
+    return {
+        "ok": True,
+        "est_tokens": est_tokens,
+        "complexity": complexity,
+        "rationale": rationale,
+        # 0017: the auxiliary model that produced the estimate is still model
+        # identity — blanked on an isolated dashboard.
+        "model": "" if _model_control_hidden() else model,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2040,6 +2290,14 @@ def model_options():
     custom-provider probes: the dropdown needs names fast, not $/Mtok
     columns (a slow/offline local endpoint must not hang the drawer).
     """
+    # 0017: the catalog is the whole authenticated provider + model roster —
+    # /api/model/options re-exposed under the plugin prefix, where the core
+    # deny-prefix middleware cannot see it. On an isolated dashboard return the
+    # same empty shape the exception path degrades to (the UI already handles
+    # it); a 403 here would break the drawer for a surface the viewer cannot
+    # use anyway.
+    if _model_control_hidden():
+        return {"providers": []}
     try:
         from hermes_cli.inventory import build_models_payload, load_picker_context
 
@@ -2078,6 +2336,10 @@ class CreateBoardBody(BaseModel):
     icon: Optional[str] = None
     color: Optional[str] = None
     default_workdir: Optional[str] = None
+    # First-class Project (id or slug) to scope the board to. When set, the
+    # board's default_workdir mirrors the project's primary repo and new tasks
+    # inherit the project (deterministic worktree + branch).
+    project_id: Optional[str] = None
     switch: bool = False
 
 
@@ -2089,6 +2351,38 @@ class RenameBoardBody(BaseModel):
     # Board-level default project directory for new tasks. ``None`` =
     # leave unchanged; empty string = clear; a path = validate + set.
     default_workdir: Optional[str] = None
+    # Project scope (id or slug). ``None`` = leave unchanged; empty = clear;
+    # a value = resolve + set (and mirror default_workdir to its primary repo).
+    project_id: Optional[str] = None
+
+
+def _resolve_project(ref: Optional[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Resolve a project id/slug to ``(id, name, primary_path)``.
+
+    Returns ``(None, None, None)`` for a falsy ref. Raises 400 when a
+    non-empty ref doesn't resolve to an existing project.
+    """
+    if not ref or not ref.strip():
+        return None, None, None
+    try:
+        from hermes_cli import projects_db as pdb
+        with pdb.connect_closing() as pconn:
+            proj = pdb.get_project(pconn, ref.strip())
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"projects unavailable: {exc}")
+    if proj is None:
+        raise HTTPException(status_code=400, detail=f"project {ref!r} does not exist")
+    return proj.id, proj.name, (proj.primary_path or None)
+
+
+def _projects_by_id() -> dict[str, Any]:
+    """Map every project id -> Project (archived included) for annotation."""
+    try:
+        from hermes_cli import projects_db as pdb
+        with pdb.connect_closing() as pconn:
+            return {p.id: p for p in pdb.list_projects(pconn, include_archived=True)}
+    except Exception:
+        return {}
 
 
 def _board_counts(slug: str) -> dict[str, int]:
@@ -2120,16 +2414,54 @@ def _default_workspace_kind(board: dict[str, Any]) -> str:
         return "dir"
 
 
+@router.get("/projects")
+def list_kanban_projects():
+    """List first-class Hermes projects for board scoping.
+
+    Returns ``{projects: [{id, slug, name, primary_path, icon, color}]}``.
+    Archived projects are excluded — a board can only be scoped to a live one.
+    """
+    try:
+        from hermes_cli import projects_db as pdb
+        with pdb.connect_closing() as pconn:
+            projects = pdb.list_projects(pconn, include_archived=False)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"failed to list projects: {exc}")
+    return {
+        "projects": [
+            {
+                "id": p.id,
+                "slug": p.slug,
+                "name": p.name,
+                "primary_path": p.primary_path or "",
+                "icon": p.icon or "",
+                "color": p.color or "",
+            }
+            for p in projects
+        ]
+    }
+
+
 @router.get("/boards")
 def list_boards(include_archived: bool = Query(False)):
     """Return every board on disk with task counts and the active slug."""
     boards = kanban_db.list_boards(include_archived=include_archived)
     current = kanban_db.get_current_board()
+    proj_map = _projects_by_id()
     for b in boards:
         b["is_current"] = (b["slug"] == current)
         b["counts"] = _board_counts(b["slug"])
-        b["total"] = sum(b["counts"].values())
+        # Live cards only — archived tasks are hidden from every default
+        # board view, so advertising them in the switcher badge makes the
+        # two counts visibly disagree.
+        b["total"] = sum(
+            n for status, n in b["counts"].items() if status != "archived"
+        )
         b["default_workspace_kind"] = _default_workspace_kind(b)
+        pid = b.get("project_id") or None
+        b["project_id"] = pid
+        proj = proj_map.get(pid) if pid else None
+        b["project_name"] = proj.name if proj else None
     return {"boards": boards, "current": current}
 
 
@@ -2159,6 +2491,11 @@ def create_board_endpoint(payload: CreateBoardBody):
     default_workdir = None
     if payload.default_workdir:
         default_workdir = _validate_workdir(payload.default_workdir)
+    # A chosen project scopes the board: its primary repo becomes the default
+    # workdir (unless one was passed explicitly) and the link is stored.
+    project_id, _pname, primary_path = _resolve_project(payload.project_id)
+    if primary_path and not default_workdir:
+        default_workdir = primary_path
     try:
         meta = kanban_db.create_board(
             payload.slug,
@@ -2167,6 +2504,7 @@ def create_board_endpoint(payload: CreateBoardBody):
             icon=payload.icon,
             color=payload.color,
             default_workdir=default_workdir,
+            project_id=project_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2176,6 +2514,7 @@ def create_board_endpoint(payload: CreateBoardBody):
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
     meta["default_workspace_kind"] = _default_workspace_kind(meta)
+    _, meta["project_name"], _ = _resolve_project(meta.get("project_id"))
     return {"board": meta, "current": kanban_db.get_current_board()}
 
 
@@ -2194,6 +2533,17 @@ def rename_board(slug: str, payload: RenameBoardBody):
     if payload.default_workdir is not None:
         raw = payload.default_workdir.strip()
         default_workdir = _validate_workdir(raw) if raw else ""
+    # project_id: None = leave; "" = clear; value = resolve + mirror its repo
+    # into default_workdir (unless the caller set default_workdir explicitly).
+    project_id: Optional[str] = None
+    project_name: Optional[str] = None
+    if payload.project_id is not None:
+        if payload.project_id.strip():
+            project_id, project_name, primary_path = _resolve_project(payload.project_id)
+            if primary_path and default_workdir is None:
+                default_workdir = primary_path
+        else:
+            project_id = ""  # clear the scope
     meta = kanban_db.write_board_metadata(
         normed,
         name=payload.name,
@@ -2201,8 +2551,10 @@ def rename_board(slug: str, payload: RenameBoardBody):
         icon=payload.icon,
         color=payload.color,
         default_workdir=default_workdir,
+        project_id=project_id,
     )
     meta["default_workspace_kind"] = _default_workspace_kind(meta)
+    _, meta["project_name"], _ = _resolve_project(meta.get("project_id"))
     return {"board": meta}
 
 
@@ -2275,8 +2627,11 @@ def list_profile_roster():
             {
                 "name": p.name,
                 "is_default": bool(p.is_default),
-                "model": p.model or "",
-                "provider": p.provider or "",
+                # 0017: profile records carry the model/provider each profile
+                # runs on — blanked on an isolated dashboard (the roster shape
+                # is kept so the orchestrator picker still lists names).
+                "model": "" if _model_control_hidden() else (p.model or ""),
+                "provider": "" if _model_control_hidden() else (p.provider or ""),
                 "description": p.description or "",
                 "description_auto": bool(p.description_auto),
                 "skill_count": int(p.skill_count or 0),
@@ -2563,6 +2918,13 @@ async def stream_events(ws: WebSocket):
                         payload = json.loads(r["payload"]) if r["payload"] else None
                     except Exception:
                         payload = None
+                    # 0017: task_events payloads are raw JSON with no other
+                    # serialization chokepoint — ``model_override_set`` /
+                    # ``reasoning_effort_set`` events carry the exact fields
+                    # ``_task_dict`` scrubs, so scrub them here too.
+                    if payload and _model_control_hidden():
+                        for _key in _MODEL_OVERRIDE_TASK_KEYS:
+                            payload.pop(_key, None)
                     out.append({
                         "id": r["id"],
                         "task_id": r["task_id"],

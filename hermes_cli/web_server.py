@@ -102,7 +102,7 @@ from utils import env_var_enabled
 
 try:
     from fastapi import (
-        FastAPI, File, Form, HTTPException, Request, UploadFile,
+        FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
         WebSocket, WebSocketDisconnect,
     )
     from fastapi.middleware.cors import CORSMiddleware
@@ -118,7 +118,7 @@ except ImportError:
         from tools.lazy_deps import ensure as _lazy_ensure
         _lazy_ensure("tool.dashboard", prompt=False)
         from fastapi import (
-            FastAPI, File, Form, HTTPException, Request, UploadFile,
+            FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
             WebSocket, WebSocketDisconnect,
         )
         from fastapi.middleware.cors import CORSMiddleware
@@ -169,10 +169,40 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
 
 
 def _warm_gateway_module() -> None:
-    try:
-        import hermes_cli.gateway  # noqa: F401
-    except Exception:
-        pass
+    """Pre-import heavy modules so the event loop is not stalled on first use.
+
+    On a cold Windows install, importing these module chains triggers .pyc
+    compilation and Defender real-time scans that can stall the event loop
+    for 15-30s. The original fix (pre-#60800) only warmed
+    ``hermes_cli.gateway``. But the first WS connection and its initial
+    RPC burst (``setup.status``, ``setup.runtime_check``,
+    ``gateway.ready``→``resolve_skin``) pull in several *other* heavy
+    chains that were still imported on the loop thread, contributing to
+    the ~14s cold-start stall (#60800). Warm them all here so the cost
+    is paid in a worker thread while the server socket is already open.
+    """
+    for mod in (
+        "hermes_cli.gateway",
+        # setup.status / setup.runtime_check resolve provider auth state,
+        # which imports copilot_auth (→ subprocess module) and scans
+        # credential files. First import is noticeably slow on Windows.
+        "hermes_cli.auth",
+        "hermes_cli.copilot_auth",
+        "hermes_cli.runtime_provider",
+        # resolve_skin() reads config + initialises the skin engine.
+        # Even though handle_ws now calls it via asyncio.to_thread
+        # (see tui_gateway/ws.py), warming it here avoids the first-call
+        # import cost inside that thread.
+        "hermes_cli.skin_engine",
+        # model.options / picker context — parses provider catalogs and
+        # the models.dev cache on first use.
+        "hermes_cli.inventory",
+        "hermes_cli.model_switch",
+    ):
+        try:
+            __import__(mod)
+        except Exception:
+            pass
 
 
 def _resolve_restart_drain_timeout() -> float:
@@ -423,6 +453,13 @@ def _require_token(request: Request) -> None:
         # authenticated. Belt-and-braces: confirm the session is present.
         if getattr(request.state, "session", None) is not None:
             return
+        # A headless desktop-remote client authenticates via the session-token
+        # provider (gated_auth_middleware sets token_authenticated, not a cookie
+        # session). Honour it here too — otherwise every _require_token op
+        # (plugin install/enable/disable, …) 401s for the Desktop app. Mirrors
+        # auth_middleware and the plugins gate, which already accept it.
+        if getattr(request.state, "token_authenticated", False):
+            return
         raise HTTPException(status_code=401, detail="Unauthorized")
     if not _has_valid_session_token(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -599,6 +636,54 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
                                 status_code=404,
                                 content={"detail": "Plugin not found"},
                             )
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def _isolated_provider_config_gate(request: Request, call_next):
+    """Deny-by-default gate over the provider/credential config surface on an
+    --isolated (per-owner) dashboard.
+
+    Model/provider selection and credentials are a PLATFORM decision on an
+    isolated dashboard. 0017 originally gated this by enumerating the specific
+    route names to refuse. Enumerating routes to gate has failed silently three
+    times on this platform — the /api/files/* bypass, the Slack allowed-channels
+    allowlist, and the no-iac tag — because upstream keeps growing a *parallel*
+    route in the same family that the enumeration never named, so it ships open.
+    The July 2026 delta did it again: ``/api/providers/custom-endpoints/{id}/
+    activate`` writes ``cfg["model"]`` (a model-selection write) and the GET
+    leaks provider/base_url — none of which 0017's enumerated guard covered.
+
+    Invert it: refuse the WHOLE provider/credential family by prefix, so a new
+    upstream route in these families is denied on arrival rather than shipping
+    ungated. The reads an isolated dashboard legitimately needs (chat-header
+    model info, Config, analytics) are model-SCRUBBED per-handler and live under
+    /api/model, /api/config, /api/analytics — NOT under these prefixes — so they
+    are unaffected. Nothing under /api/providers or /api/credentials is a
+    legitimate isolated-dashboard read: the whole surface is provider/model
+    identity, credentials, or a config mutation.
+
+    Registered BEFORE the auth middlewares (executes AFTER them), exactly like
+    ``_plugin_api_runtime_gate``: an unauthenticated caller must get auth's 401
+    first, so this can never be used to fingerprint routes. A no-op on the
+    machine (non-isolated) dashboard, where full model administration is intended.
+    """
+    if _model_control_hidden() and _isolated_config_surface_denied(
+        request.method, request.url.path
+    ):
+        _authed = (
+            getattr(request.state, "token_authenticated", False)
+            or getattr(request.app.state, "auth_required", False)
+            or _has_valid_session_token(request)
+            or _has_valid_query_token(request, request.url.path)
+        )
+        if _authed:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": "Provider and model configuration is managed by the platform.",
+                },
+            )
     return await call_next(request)
 
 
@@ -1873,6 +1958,131 @@ _FS_MIME_TYPES = {
 }
 
 
+def _assert_fs_path_allowed(resolved: Path) -> None:
+    """Deny-by-default filesystem containment for an --isolated dashboard.
+
+    ``_fs_path`` is the single chokepoint for EVERY file-browser (``/api/fs/*``)
+    and git (``/api/git/*`` via ``_git_path``) route, and those routes take a
+    client-supplied ABSOLUTE path — they never flow through the ``?profile=``
+    resolver that ``_assert_profile_allowed`` guards. So a valid per-profile
+    desktop-remote token would otherwise let an owner read/write ANY file the
+    hermes user can touch, including sibling profiles' ``.env`` / ``secrets/`` /
+    ``state.db`` and the shared credential blob. This is the second isolation
+    door; gate it here.
+
+    Rule (only when isolated): the resolved, symlink-collapsed path must be
+    EITHER under this instance's own ``$HERMES_HOME`` (``.hermes/profiles/<self>``)
+    OR entirely OUTSIDE the hermes state root (``.hermes``) — the latter is the
+    coding-rail's repo working roots, which legitimately live elsewhere. Any
+    path that is under the hermes root but NOT under our own home — i.e. every
+    sibling ``profiles/<other>``, ``shared/``, the machine ``dashboard*`` creds,
+    and the top-level config/credentials — is refused. Applies to read AND
+    write, fs AND git, because every access resolves through here first.
+
+    Supplementary hard denylist: the hermes USER's host credential/secret stores
+    (``~/.ssh``, ``~/.aws``, …) sit OUTSIDE ``.hermes`` and would otherwise be
+    permitted by the "outside the hermes tree" allowance — but copying an SSH key
+    or AWS creds out of one isolated dashboard is full lateral movement that
+    defeats the isolation. Those are hard-denied even outside ``.hermes``. This
+    is ON TOP OF the own-home allowlist, not a replacement, so real repo roots
+    (``/opt/...`` etc.) keep working.
+
+    No-op when not isolated (the all-profiles machine dashboard is unchanged).
+    """
+    iso = _isolated_profile()
+    if not iso:
+        return
+    from hermes_constants import get_hermes_home, get_default_hermes_root
+
+    def _under(base: Optional[Path], p: Path) -> bool:
+        if base is None:
+            return False
+        try:
+            p.relative_to(base)
+            return True
+        except ValueError:
+            return False
+
+    try:
+        own_home = Path(get_hermes_home()).resolve(strict=False)
+    except Exception:
+        own_home = None
+    try:
+        hermes_root = Path(get_default_hermes_root()).resolve(strict=False)
+    except Exception:
+        # Fall back to the parent-of-profiles derived from our own home, else
+        # the well-known layout — never leave the sensitive tree ungated.
+        hermes_root = own_home.parent.parent if own_home is not None else None
+
+    # Our own home is always allowed (no host-credential store lives under it).
+    if _under(own_home, resolved):
+        return
+
+    # Resolve the hermes user's $HOME at runtime; compare on the already-resolved
+    # (symlink/.. collapsed) path so escapes are covered.
+    try:
+        user_home = Path.home().resolve(strict=False)
+    except Exception:
+        user_home = (
+            hermes_root.parent
+            if hermes_root is not None
+            else (own_home.parent.parent if own_home is not None else None)
+        )
+
+    # Redundant hard denylist (belt-and-suspenders on top of the deny-by-default
+    # below; also the sole guard for the rare case where $HOME cannot be
+    # resolved but a well-known store path is passed).
+    if user_home is not None:
+        for _store in (
+            user_home / ".ssh",
+            user_home / ".aws",
+            user_home / ".config" / "gh",
+            user_home / ".config" / "gcloud",
+            user_home / ".config" / "git",
+            user_home / ".gnupg",
+            user_home / ".kube",
+            user_home / ".docker" / "config.json",
+            user_home / ".netrc",
+            user_home / ".git-credentials",
+            user_home / ".gitconfig",
+            user_home / ".claude",
+        ):
+            if _under(_store, resolved):
+                raise HTTPException(
+                    status_code=403,
+                    detail="This dashboard is scoped to a single profile.",
+                )
+
+    # Fail closed if we could not establish our own home: deny the whole hermes
+    # $HOME and state root (better a false 403 than a cross-profile read).
+    if own_home is None:
+        for _deny in (user_home, hermes_root, Path("/home/hermes")):
+            if _deny is not None and _under(_deny, resolved):
+                raise HTTPException(
+                    status_code=403,
+                    detail="This dashboard is scoped to a single profile.",
+                )
+        return
+
+    # Deny-by-default across the hermes user's $HOME. Everything under $HOME that
+    # is NOT our own profile home (allowed above) is refused: the dotfiles /
+    # secret stores (~/.ssh, ~/.gitconfig, ~/.claude, ~/.config/*, ~/.local/*),
+    # sibling profiles/<other>, shared/, and the machine dashboard creds — the
+    # whole home tree. An enumerated secret denylist is insufficient: every new
+    # tool's dotfile (~/.claude/.credentials.json, ~/.config/doppler, ~/.npmrc,
+    # ~/.terraform.d, ~/.pypirc, …) would otherwise be a fresh exfil path. The
+    # coding-rail repo working roots live OUTSIDE $HOME (e.g. /opt/...), so they
+    # stay allowed; only $HOME is deny-by-default. The hermes state root is also
+    # denied explicitly in case it is ever configured outside $HOME.
+    if _under(user_home, resolved) or _under(hermes_root, resolved):
+        raise HTTPException(
+            status_code=403,
+            detail="This dashboard is scoped to a single profile.",
+        )
+    # Outside $HOME and the hermes state root entirely (repo working roots such
+    # as /opt/..., plus OS-permission-bounded system paths) -> permitted.
+
+
 def _fs_path(raw_path: str) -> Path:
     raw = str(raw_path or "").strip()
     if not raw:
@@ -1888,9 +2098,14 @@ def _fs_path(raw_path: str) -> Path:
         candidate = Path(raw).expanduser()
         if not candidate.is_absolute():
             candidate = Path.cwd() / candidate
-        return candidate.resolve(strict=False)
+        resolved = candidate.resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
         raise HTTPException(status_code=400, detail="Invalid path")
+    # Enforce --isolated containment on the fully-resolved (symlink/.. collapsed)
+    # path, so a sibling-profile or shared-secret path can't be reached via the
+    # file-browser / git rails. No-op for the machine dashboard.
+    _assert_fs_path_allowed(resolved)
+    return resolved
 
 
 def _fs_mime_type(path: Path) -> str:
@@ -2177,6 +2392,18 @@ def _resolve_managed_path(
     if root is not None and not _path_is_under(root, resolved):
         raise HTTPException(status_code=403, detail="Path outside managed files root")
 
+    # --isolated containment. The managed-files browser (/api/files/*) is a
+    # SECOND file-browser family that resolves client paths through here, NOT
+    # through _fs_path — so it never reached _assert_fs_path_allowed. When
+    # isolated and neither HERMES_DASHBOARD_FILES_ROOT nor the /opt/data hosted
+    # layout forces a locked_root, _managed_files_policy falls through to
+    # locked_root=None (home browse), so the check above is skipped and a
+    # per-profile token could reach ~/.ssh, a sibling profiles/<other>/state.db,
+    # ~/.docker/config.json, etc. Gate the resolved (symlink/.. collapsed) path
+    # through the same chokepoint the fs/git rails use — read AND write
+    # (for_write resolves the target too). No-op for the machine dashboard.
+    _assert_fs_path_allowed(resolved)
+
     return policy, resolved, str(resolved)
 
 
@@ -2196,6 +2423,11 @@ def _managed_file_entry(policy: ManagedFilesPolicy, target: Path) -> Dict[str, A
         raise HTTPException(status_code=400, detail="Invalid path")
     if policy.locked_root is not None and not _path_is_under(policy.locked_root, resolved):
         raise HTTPException(status_code=403, detail="Path outside managed files root")
+    # Directory listings resolve each child here; a child symlink pointing at a
+    # sibling profile or a host secret store would otherwise leak its metadata
+    # (and seed a subsequent /api/files/read) when locked_root is None under
+    # isolation. Apply the same containment as the resolve/fs chokepoints.
+    _assert_fs_path_allowed(resolved)
 
     try:
         st = resolved.stat()
@@ -2325,11 +2557,20 @@ async def list_managed_files(request: Request, path: Optional[str] = None):
         raise HTTPException(status_code=400, detail="Path is not a directory")
 
     try:
-        entries = [
-            _managed_file_entry(policy, child)
-            for child in target.iterdir()
-            if not _is_sensitive_path(child)
-        ]
+        entries = []
+        for child in target.iterdir():
+            if _is_sensitive_path(child):
+                continue
+            try:
+                entries.append(_managed_file_entry(policy, child))
+            except HTTPException as exc:
+                # Under --isolated, a child outside this profile's allowed scope
+                # (sibling profile, host dotfile, symlink escape) is 403'd by
+                # _assert_fs_path_allowed. Skip it rather than aborting the whole
+                # listing (mirrors how /api/fs/list degrades on a denied child).
+                if exc.status_code == 403:
+                    continue
+                raise
     except PermissionError:
         raise HTTPException(status_code=403, detail="Directory is not readable")
     except OSError as exc:
@@ -2911,6 +3152,62 @@ def _collect_profile_gateway_topology() -> Dict[str, Any]:
     return {"profiles": profile_names, "gateway_mode": mode, "gateways": gateways}
 
 
+# /api/status is polled ~1/s by the desktop app while it waits for the backend
+# (and again by the dashboard badge). Each uncached call above walks 7+ profile
+# homes (yaml.safe_load with the pure-Python loader + psutil process-table
+# probes + realpath walks) inside the default executor; concurrent polls pile
+# up and hold the GIL for 14-16s, starving the event loop — the desktop WS
+# never receives gateway.ready and boot fails ("event loop stalled ... GIL
+# pressure suspected"). Topology changes on gateway start/stop, so a short TTL
+# cache with a collapse lock keeps the scan to one per window. The cache also
+# remembers which collector produced the entry: tests monkeypatch
+# _collect_profile_gateway_topology per case, and the identity check keeps
+# them hermetic without needing a reset hook (a swapped collector is a miss).
+_TOPOLOGY_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None, "fn": None}
+_TOPOLOGY_CACHE_LOCK = threading.Lock()
+_TOPOLOGY_CACHE_TTL = 10.0
+
+
+def _topology_cache_get(fn: Any) -> Optional[Dict[str, Any]]:
+    if (
+        _TOPOLOGY_CACHE["data"] is not None
+        and _TOPOLOGY_CACHE["fn"] is fn
+        and time.monotonic() - _TOPOLOGY_CACHE["ts"] < _TOPOLOGY_CACHE_TTL
+    ):
+        return _TOPOLOGY_CACHE["data"]
+    return None
+
+
+def _collect_profile_gateway_topology_cached() -> Dict[str, Any]:
+    fn = _collect_profile_gateway_topology
+    cached = _topology_cache_get(fn)
+    if cached is not None:
+        return cached
+    with _TOPOLOGY_CACHE_LOCK:
+        cached = _topology_cache_get(fn)
+        if cached is not None:
+            return cached
+        data = fn()
+        _TOPOLOGY_CACHE["data"] = data
+        _TOPOLOGY_CACHE["fn"] = fn
+        _TOPOLOGY_CACHE["ts"] = time.monotonic()
+        return data
+
+
+def _load_configured_gateway_platforms() -> set[str]:
+    """Load connected platform names away from the asyncio event loop.
+
+    The first ``load_gateway_config()`` call performs platform discovery and
+    can take longer than Desktop's WebSocket connect timeout on Windows.  This
+    helper is synchronous by design; ``get_status`` runs it in Starlette's
+    worker pool so a concurrent ``/api/ws`` handshake can still complete.
+    """
+    from gateway.config import load_gateway_config
+
+    gateway_config = load_gateway_config()
+    return {platform.value for platform in gateway_config.get_connected_platforms()}
+
+
 @app.get("/api/ssh/ownership")
 async def get_ssh_ownership(request: Request):
     _require_token(request)
@@ -3012,12 +3309,9 @@ async def get_status(profile: Optional[str] = None):
         gateway_updated_at = None
         configured_gateway_platforms: set[str] | None = None
         try:
-            from gateway.config import load_gateway_config
-
-            gateway_config = load_gateway_config()
-            configured_gateway_platforms = {
-                platform.value for platform in gateway_config.get_connected_platforms()
-            }
+            configured_gateway_platforms = await run_in_threadpool(
+                _load_configured_gateway_platforms
+            )
         except Exception:
             configured_gateway_platforms = None
 
@@ -3237,7 +3531,7 @@ async def get_status(profile: Optional[str] = None):
         # per-gateway ``gateways[]`` detail carries host ports (deployment
         # recon), so it stays gated with the host paths / PID below.
         topology = await asyncio.get_running_loop().run_in_executor(
-            None, _collect_profile_gateway_topology
+            None, _collect_profile_gateway_topology_cached
         )
         status["profiles"] = topology["profiles"]
         status["gateway_mode"] = topology["gateway_mode"]
@@ -4320,7 +4614,20 @@ async def get_elevenlabs_voices(profile: Optional[str] = None):
     # Config-only scope (await-safe): the key lookup reads the requested
     # profile's .env, matching the profile the settings UI writes to.
     with _config_profile_scope(profile):
-        api_key = (load_env().get("ELEVENLABS_API_KEY") or os.environ.get("ELEVENLABS_API_KEY") or "").strip()
+        api_key = (load_env().get("ELEVENLABS_API_KEY") or "").strip()
+    if not api_key:
+        # Fallback for env-only deployments — scope-aware (Slack pattern):
+        # under multiplex os.environ may hold another profile's key, so
+        # honor the installed scope's verdict before touching the env.
+        try:
+            from agent.secret_scope import UnscopedSecretError, get_secret
+
+            try:
+                api_key = (get_secret("ELEVENLABS_API_KEY") or "").strip()
+            except UnscopedSecretError:
+                api_key = (os.environ.get("ELEVENLABS_API_KEY") or "").strip()
+        except Exception:
+            api_key = (os.environ.get("ELEVENLABS_API_KEY") or "").strip()
     if not api_key:
         return {"available": False, "voices": []}
 
@@ -5507,6 +5814,12 @@ def _normalize_memory_provider_schema(name: str, provider: Any) -> List[Dict[str
             kind = "select"
         elif explicit_kind in {"bool", "boolean"} or isinstance(raw.get("default"), bool):
             kind = "boolean"
+        elif explicit_kind in {"int", "integer"} or (
+            isinstance(raw.get("default"), int) and not isinstance(raw.get("default"), bool)
+        ):
+            kind = "integer"
+        elif explicit_kind in {"float", "number"} or isinstance(raw.get("default"), float):
+            kind = "number"
         else:
             kind = "text"
 
@@ -5527,6 +5840,9 @@ def _normalize_memory_provider_schema(name: str, provider: Any) -> List[Dict[str
             "options": options,
             "url": str(raw.get("url") or ""),
             "when": raw.get("when") if isinstance(raw.get("when"), dict) else None,
+            "minimum": raw.get("minimum"),
+            "maximum": raw.get("maximum"),
+            "step": raw.get("step"),
             "_env_key": str(raw.get("env_var") or "") or None,
         })
 
@@ -5670,6 +5986,9 @@ def _public_memory_provider_field(field: Dict[str, Any], data: Dict[str, Any]) -
         "options": field.get("options", []),
         "url": field.get("url", ""),
         "when": field.get("when"),
+        "minimum": field.get("minimum"),
+        "maximum": field.get("maximum"),
+        "step": field.get("step"),
     }
     return entry
 
@@ -5691,6 +6010,31 @@ def _memory_provider_payload(name: str, provider: Any) -> Dict[str, Any]:
 def _coerce_schema_field(field: Dict[str, Any], raw: Any) -> Any:
     if field["kind"] == "boolean":
         return _coerce_bool(raw, default=_coerce_bool(_field_default(field), default=False))
+
+    if field["kind"] in {"integer", "number"}:
+        value = raw if raw is not None and raw != "" else _field_default(field)
+        try:
+            if isinstance(value, bool):
+                raise ValueError
+            parsed = float(value)
+            if not math.isfinite(parsed):
+                raise ValueError
+            if field["kind"] == "integer":
+                if not parsed.is_integer():
+                    raise ValueError
+                result: int | float = int(parsed)
+            else:
+                result = parsed
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid numeric value for '{field['key']}'") from exc
+
+        minimum = field.get("minimum")
+        maximum = field.get("maximum")
+        if minimum is not None and result < minimum:
+            raise ValueError(f"'{field['key']}' must be at least {minimum}")
+        if maximum is not None and result > maximum:
+            raise ValueError(f"'{field['key']}' must be at most {maximum}")
+        return result
 
     value = str(raw if raw is not None else "").strip()
     if field["kind"] == "select":
@@ -5909,6 +6253,7 @@ async def setup_memory_provider(name: str, body: MemoryProviderSetupRequest):
         except Exception:
             _log.exception("Failed to persist memory provider setup values for %s", name)
             raise HTTPException(status_code=500, detail="Internal server error")
+    _invalidate_plugins_hub_cache()
     return _install_memory_provider_setup(name)
 
 
@@ -5926,6 +6271,7 @@ async def update_memory_provider_config(
                 if declared is None:
                     raise HTTPException(status_code=404, detail=f"Unknown memory provider: {name}")
                 _update_memory_provider_config(declared, _stringify_submitted_values(values))
+                _invalidate_plugins_hub_cache()
                 return {"ok": True}
 
             provider = _load_memory_provider(name)
@@ -5940,6 +6286,7 @@ async def update_memory_provider_config(
                 config["memory"] = memory_config
             memory_config["provider"] = name
             save_config(config)
+            _invalidate_plugins_hub_cache()
             return {"ok": True, "active": name}
 
     try:
@@ -5957,6 +6304,7 @@ async def update_memory_provider_config(
 async def get_config(profile: Optional[str] = None):
     with _profile_scope(profile):
         config = _normalize_config_for_web(load_config())
+    config = _scrub_model_config_keys(config)
     # Strip internal keys that the frontend shouldn't see or send back
     return {k: v for k, v in config.items() if not k.startswith("_")}
 
@@ -5977,8 +6325,28 @@ async def get_schema(profile: Optional[str] = None):
 
 
 @app.get("/api/egress/status")
-async def get_egress_status():
-    """Dashboard/Desktop-readable egress proxy status and remediation text."""
+async def get_egress_status(request: Request):
+    """Dashboard/Desktop-readable egress proxy status and remediation text.
+
+    Upstream shipped this route with NO auth call at all, and its payload is a
+    provider/upstream identity dump: ``format_status_text`` lists every mapped
+    credential env name, the upstream hosts each one may reach, a redacted
+    token per mapping, and the "uncovered providers" whose real keys are still
+    visible in the sandbox. That is exactly what 0017 exists to hide.
+
+    Two gates, matching the rest of this patch:
+
+    * ``_require_token`` — the same explicit gate ``/api/ssh/ownership`` uses,
+      so the route is never reachable unauthenticated on any bind mode.
+    * model-identity scrub — on an isolated (per-owner) dashboard the whole
+      ``/api/egress/`` family is ALSO refused by ``_isolated_provider_config_gate``
+      (deny-by-default, see ``_ISOLATED_DENY_PREFIXES``). This per-handler scrub
+      is defense in depth for the case where middleware order ever changes: it
+      returns a neutral notice instead of the provider dump.
+    """
+    _require_token(request)
+    if _model_control_hidden():
+        return {"text": _EGRESS_STATUS_PLATFORM_NOTICE}
     from hermes_cli.proxy_cli import format_status_text
 
     return {"text": format_status_text()}
@@ -6002,6 +6370,8 @@ def get_model_info(profile: Optional[str] = None):
     frontend can display "Auto-detected: 200K" alongside the override field.
     Also returns model capabilities (vision, reasoning, tools) when available.
     """
+    if _model_control_hidden():
+        return dict(_EMPTY_MODEL_INFO)
     try:
         with _profile_scope(profile):
             cfg = load_config()
@@ -6121,6 +6491,7 @@ async def get_model_options(
     re-fetches its live catalog — used by the picker's explicit "Refresh
     Models" control. Normal opens leave it false to stay on the 1h cache.
     """
+    _assert_model_control_allowed()
     try:
         from hermes_cli.inventory import build_model_options_payload, load_picker_context
 
@@ -6158,6 +6529,7 @@ def get_recommended_default_model(provider: str = ""):
     where free_tier is True/False for Nous and None otherwise. `model` may be
     empty if nothing could be resolved (caller degrades gracefully).
     """
+    _assert_model_control_allowed()
     slug = (provider or "").strip().lower()
 
     if slug == "nous":
@@ -6238,6 +6610,7 @@ def get_auxiliary_models(profile: Optional[str] = None):
     the dashboard profile's auxiliary pins while /api/model/set wrote the
     selected profile's (read/write asymmetry).
     """
+    _assert_model_control_allowed()
     try:
         with _profile_scope(profile):
             cfg = load_config()
@@ -6275,6 +6648,7 @@ def get_auxiliary_models(profile: Optional[str] = None):
 @app.get("/api/model/moa")
 def get_moa_models(profile: Optional[str] = None):
     """Return the configured Mixture-of-Agents provider/model slots."""
+    _assert_model_control_allowed()
     try:
         from hermes_cli.moa_config import normalize_moa_config
 
@@ -6291,6 +6665,7 @@ def get_moa_models(profile: Optional[str] = None):
 @app.put("/api/model/moa")
 def set_moa_models(body: MoaConfigPayload, profile: Optional[str] = None):
     """Persist the Mixture-of-Agents provider/model slots."""
+    _assert_model_control_allowed()
     try:
         from hermes_cli.moa_config import normalize_moa_config, validate_moa_payload
 
@@ -6370,6 +6745,7 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
     The currently running chat PTY (if any) is not affected; use the
     ``/model`` slash command inside a chat to hot-swap that specific session.
     """
+    _assert_model_control_allowed()
     scope = (body.scope or "").strip().lower()
     provider = (body.provider or "").strip()
     model = (body.model or "").strip()
@@ -6742,6 +7118,7 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.put("/api/config")
 async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
+    _assert_no_model_config_write(body.config)
     try:
         with _profile_scope(body.profile or profile):
             # The dashboard form is schema-driven (see CONFIG_SCHEMA). Any root
@@ -7323,8 +7700,8 @@ async def validate_custom_endpoint(body: CustomEndpointUpdate):
         headers["Authorization"] = f"Bearer {body.api_key.strip()}"
 
     try:
-        with httpx.Client(timeout=httpx.Timeout(8.0)) as client:
-            resp = client.get(url, headers=headers)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
+            resp = await client.get(url, headers=headers)
     except Exception:
         return {"ok": False, "reachable": False, "message": f"Could not reach {url}.", "models": []}
 
@@ -7365,8 +7742,8 @@ async def validate_provider_credential(body: EnvVarUpdate, request: Request):
         api_key = (body.api_key or "").strip()
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
         try:
-            with httpx.Client(timeout=httpx.Timeout(8.0)) as client:
-                resp = client.get(url, headers=headers)
+            async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
+                resp = await client.get(url, headers=headers)
             return {"ok": True, "reachable": True, "message": "", "models": _parse_model_ids(resp)}
         except Exception:
             return {"ok": False, "reachable": False, "message": f"Could not reach {url}."}
@@ -7385,8 +7762,8 @@ async def validate_provider_credential(body: EnvVarUpdate, request: Request):
         params["key"] = value
 
     try:
-        with httpx.Client(timeout=httpx.Timeout(10.0)) as client:
-            resp = client.get(url, headers=headers, params=params)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            resp = await client.get(url, headers=headers, params=params)
     except Exception:
         return {"ok": False, "reachable": False, "message": "Could not reach the provider to verify the key."}
 
@@ -10677,13 +11054,23 @@ def _codex_full_login_worker(session_id: str) -> None:
             sess["interval"] = poll_interval
             sess["expires_in"] = 15 * 60  # OpenAI's effective limit
             sess["expires_at"] = time.time() + sess["expires_in"]
+            # Captured now (not re-derived after cancel pops the session) so a
+            # cancelled session can never fall back to the caller's current
+            # profile scope at save time.
+            session_profile = sess.get("profile")
 
         # Step 2: poll until authorized
         deadline = time.monotonic() + sess["expires_in"]
         code_resp = None
         with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
             while time.monotonic() < deadline:
+                if sess.get("cancelled"):
+                    _log.info("oauth/device: openai-codex login cancelled (session=%s)", session_id)
+                    return
                 time.sleep(poll_interval)
+                if sess.get("cancelled"):
+                    _log.info("oauth/device: openai-codex login cancelled (session=%s)", session_id)
+                    return
                 poll = client.post(
                     f"{issuer}/api/accounts/deviceauth/token",
                     json={"device_auth_id": device_auth_id, "user_code": user_code},
@@ -10700,6 +11087,10 @@ def _codex_full_login_worker(session_id: str) -> None:
             with _oauth_sessions_lock:
                 sess["status"] = "expired"
                 sess["error_message"] = "Device code expired before approval"
+            return
+
+        if sess.get("cancelled"):
+            _log.info("oauth/device: openai-codex login cancelled before token exchange (session=%s)", session_id)
             return
 
         # Step 3: exchange authorization_code for tokens
@@ -10729,12 +11120,23 @@ def _codex_full_login_worker(session_id: str) -> None:
 
         from hermes_cli.auth import _save_codex_tokens
 
-        with _profile_scope(_oauth_session_profile(session_id)):
-            _save_codex_tokens({
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-            })
+        # The cancellation check and the save must be one atomic critical
+        # section under the same lock cancel_oauth_session() uses. Checking
+        # "cancelled" and then saving as two separate steps left a window
+        # where DELETE could flip the flag between them and the worker would
+        # still persist tokens after the user believed the login was
+        # aborted. Holding the lock across both closes that window: DELETE
+        # either lands before this section (worker observes cancelled and
+        # returns) or blocks until this section (and the save) is done.
         with _oauth_sessions_lock:
+            if sess.get("cancelled"):
+                _log.info("oauth/device: openai-codex login cancelled before token save (session=%s)", session_id)
+                return
+            with _profile_scope(session_profile):
+                _save_codex_tokens({
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                })
             sess["status"] = "approved"
         _log.info("oauth/device: openai-codex login completed (session=%s)", session_id)
     except Exception as e:
@@ -10832,10 +11234,20 @@ async def cancel_oauth_session(
     request: Request,
     profile: Optional[str] = None,
 ):
-    """Cancel a pending OAuth session. Token-protected."""
+    """Cancel a pending OAuth session. Token-protected.
+
+    Marks the session dict ``cancelled`` before popping it so any
+    background worker still holding a reference to that same dict (e.g.
+    the Codex device-code poller) observes the cancellation and stops
+    polling/exchanging/saving instead of completing the login after the
+    user believed it was aborted.
+    """
     _require_token(request)
     with _oauth_sessions_lock:
-        sess = _oauth_sessions.pop(session_id, None)
+        sess = _oauth_sessions.get(session_id)
+        if sess is not None:
+            sess["cancelled"] = True
+        _oauth_sessions.pop(session_id, None)
     if sess is None:
         return {"ok": False, "message": "session not found"}
     return {"ok": True, "session_id": session_id}
@@ -10954,7 +11366,7 @@ async def _read_session_import_body(request: Request) -> bytes:
 
 
 def _import_sessions_for_profile(profile: Optional[str], sessions: List[Dict[str, Any]]) -> Dict[str, Any]:
-    db = _open_session_db_for_profile(profile)
+    db = _open_session_db_for_profile(profile, read_only=False)
     try:
         return db.import_sessions(sessions)
     finally:
@@ -10986,19 +11398,82 @@ from hermes_cli.web_routers.sessions import (  # noqa: E402,F401 — legacy re-e
 
 
 
-def _open_session_db_for_profile(profile: Optional[str]):
-    """Open a SessionDB for read paths, optionally for another profile.
+# Serialises the one-time writable schema bootstrap for read-only opens.
+# Concurrent first-load polls otherwise race sqlite file creation: the losers
+# open mode=ro against a store whose schema is still being written and every
+# query raises "no such table: sessions".
+_session_db_bootstrap_lock = threading.Lock()
 
-    ``profile`` None/empty → this process's own ``state.db`` (the common,
-    single-profile case). A named profile opens that profile's on-disk
-    ``state.db`` directly so the primary backend can serve cross-profile reads
-    (transcripts, detail) without spawning that profile's backend.
+# Stale-schema probe for read-only opens: compiled against the newest columns
+# the dashboard read paths query. Reads at most one row per table. Read-only
+# opens skip _reconcile_columns(), so an older store would otherwise 500 on
+# every poll until something opened it writable.
+_SESSION_DB_READ_PROBE_SQL = (
+    "SELECT (SELECT archived FROM sessions LIMIT 1), "
+    "(SELECT pinned FROM sessions LIMIT 1), "
+    "(SELECT active FROM messages LIMIT 1), "
+    "(SELECT compacted FROM messages LIMIT 1)"
+)
+
+
+def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
+    """Open a SessionDB with an explicit access mode for a profile.
+
+    ``profile`` None/empty selects this process's own ``state.db``. A named
+    profile opens that profile's on-disk store directly.
+
+    Writable opens keep the full init and repair path. Read-only opens
+    bootstrap a missing or zero-byte store once, and heal an older or
+    malformed schema through one writable open before reopening read-only.
+    The healthy read path never takes a write lock or requests a checkpoint.
     """
-    from hermes_state import SessionDB
-    if not profile:
-        return SessionDB()
-    _name, home = _cron_profile_home(profile)
-    return SessionDB(db_path=Path(home) / "state.db")
+    import sqlite3
+
+    from hermes_state import SessionDB, _default_db_path, is_malformed_db_error
+
+    if profile:
+        _name, home = _cron_profile_home(profile)
+        db_path = Path(home) / "state.db"
+    else:
+        db_path = Path(_default_db_path())
+    if not read_only:
+        return SessionDB(db_path=db_path, read_only=False)
+
+    def _needs_bootstrap() -> bool:
+        try:
+            return db_path.stat().st_size == 0
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
+    if _needs_bootstrap():
+        with _session_db_bootstrap_lock:
+            if _needs_bootstrap():
+                SessionDB(db_path=db_path, read_only=False).close()
+
+    def _open_probed():
+        db = SessionDB(db_path=db_path, read_only=True)
+        # Unit-test fakes may replace SessionDB without exposing a raw
+        # connection. Probe only real connections.
+        conn = getattr(db, "_conn", None)
+        if conn is not None:
+            try:
+                conn.execute(_SESSION_DB_READ_PROBE_SQL).fetchone()
+            except BaseException:
+                db.close()
+                raise
+        return db
+
+    try:
+        return _open_probed()
+    except sqlite3.DatabaseError as exc:
+        message = str(exc).lower()
+        stale_schema = "no such table" in message or "no such column" in message
+        if not stale_schema and not is_malformed_db_error(exc):
+            raise
+        SessionDB(db_path=db_path, read_only=False).close()
+        return _open_probed()
 
 
 # In-process throttle for the opportunistic auto-archive trigger, keyed by
@@ -11009,7 +11484,7 @@ _AUTO_ARCHIVE_CHECK_INTERVAL_S = 300.0
 _last_auto_archive_check: Dict[str, float] = {}
 
 
-def _maybe_auto_archive_for_profile(db, profile: Optional[str]) -> None:
+def _maybe_auto_archive_for_profile(profile: Optional[str]) -> None:
     """Run the config-gated stale-session auto-archive for ``profile``.
 
     The Desktop backend is spawned as ``hermes serve`` — it runs neither the
@@ -11030,10 +11505,14 @@ def _maybe_auto_archive_for_profile(db, profile: Optional[str]) -> None:
         cfg = (_load_full_config().get("sessions") or {})
         if not cfg.get("auto_archive", False):
             return
-        db.maybe_auto_archive(
-            idle_days=float(cfg.get("auto_archive_days", 3)),
-            min_interval_hours=int(cfg.get("min_interval_hours", 24)),
-        )
+        db = _open_session_db_for_profile(profile, read_only=False)
+        try:
+            db.maybe_auto_archive(
+                idle_days=float(cfg.get("auto_archive_days", 3)),
+                min_interval_hours=int(cfg.get("min_interval_hours", 24)),
+            )
+        finally:
+            db.close()
     except Exception as exc:
         _log.debug("opportunistic auto-archive skipped: %s", exc)
 
@@ -11051,11 +11530,7 @@ async def _auto_archive_ticker_loop(
     """
 
     def _sweep() -> None:
-        db = _open_session_db_for_profile(None)
-        try:
-            _maybe_auto_archive_for_profile(db, None)
-        finally:
-            db.close()
+        _maybe_auto_archive_for_profile(None)
 
     await asyncio.sleep(initial_delay_s)
     while True:
@@ -11103,7 +11578,7 @@ def _prune_sessions(body: SessionPrune):
     if has_window or (_attr_filters_set and not _older_than_explicit):
         _effective_older_than = None
     profile_home = _cron_profile_home(body.profile)[1] if body.profile else get_hermes_home()
-    db = _open_session_db_for_profile(body.profile)
+    db = _open_session_db_for_profile(body.profile, read_only=False)
     try:
         filters = dict(
             older_than_days=_effective_older_than,
@@ -11352,10 +11827,11 @@ def _cron_profile_dicts() -> List[Dict[str, Any]]:
     """Return dashboard profile records, falling back to a directory scan."""
     from hermes_cli import profiles as profiles_mod
     try:
-        return [_profile_to_dict(p) for p in profiles_mod.list_profiles()]
+        return _filter_isolated_profile_records(
+            [_profile_to_dict(p) for p in profiles_mod.list_profiles()])
     except Exception:
         _log.exception("Failed to list profiles for cron dashboard; falling back to directory scan")
-        return _fallback_profile_dicts(profiles_mod)
+        return _filter_isolated_profile_records(_fallback_profile_dicts(profiles_mod))
 
 
 def _cron_default_profile() -> str:
@@ -11388,6 +11864,10 @@ def _cron_profile_home(profile: Optional[str]) -> Tuple[str, Path]:
         profiles_mod.validate_profile_name(canon)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # This helper reimplements name validation instead of going through
+    # _resolve_profile_dir, so apply the --isolated gate here too or cron
+    # endpoints would be a cross-profile bypass.
+    _assert_profile_allowed(canon)
     if not profiles_mod.profile_exists(canon):
         raise HTTPException(status_code=404, detail=f"Profile '{canon}' does not exist.")
     return canon, profiles_mod.get_profile_dir(canon)
@@ -11528,7 +12008,7 @@ def _list_cron_job_runs_sync(job_id: str, profile: Optional[str] = None, limit: 
     except (TypeError, ValueError):
         limit_n = 20
 
-    db = _open_session_db_for_profile(selected)
+    db = _open_session_db_for_profile(selected, read_only=True)
     try:
         runs = db.list_cron_job_runs(canonical, limit=limit_n, offset=0)
         now = time.time()
@@ -12326,6 +12806,7 @@ def _pool_entry_summary(entry: Any, index: int) -> Dict[str, Any]:
 
 @app.get("/api/credentials/pool")
 async def list_credential_pool():
+    _assert_credentials_allowed()
     from agent.credential_pool import load_pool
     from hermes_cli.auth import read_credential_pool
 
@@ -12353,6 +12834,7 @@ async def list_credential_pool():
 
 @app.post("/api/credentials/pool")
 async def add_credential_pool_entry(body: CredentialPoolAdd):
+    _assert_credentials_allowed()
     import uuid as _uuid
     from agent.credential_pool import (
         load_pool,
@@ -12416,6 +12898,7 @@ async def remove_credential_pool_entry(provider: str, index: int):
     it.  Manual entries have no registered step — nothing external to clean,
     no suppression needed (they aren't re-seeded).
     """
+    _assert_credentials_allowed()
     from agent.credential_pool import load_pool
     from agent.credential_sources import find_removal_step
     from hermes_cli.auth import suppress_credential_source
@@ -12577,6 +13060,12 @@ async def run_backup(body: BackupRequest):
     args = ["backup"]
     archive: Optional[Path] = None
     output = (body.output or "").strip()
+    if output and _isolated_profile():
+        # An --isolated dashboard must not choose an arbitrary -o destination:
+        # `hermes backup -o <path>` is an unconstrained host-write primitive
+        # (clobber a sibling profile file, drop a dotfile). Ignore the client
+        # path and write to this profile's own managed backup dir instead.
+        output = ""
     if output:
         args.extend(["-o", output])
     else:
@@ -12628,6 +13117,19 @@ async def run_import(body: ImportRequest):
     archive = (body.archive or "").strip()
     if not archive:
         raise HTTPException(status_code=400, detail="archive path is required")
+    if _isolated_profile():
+        # Contain the archive path on an --isolated dashboard: without this,
+        # the os.path.isfile(archive) probe below is an arbitrary-host-path
+        # existence oracle and `hermes import <archive>` would ingest an
+        # attacker-chosen file from a sibling profile / outside the profile.
+        # Gate it through the same chokepoint the fs/git rails use (403 on
+        # sibling/secret paths) before any filesystem probe.
+        try:
+            resolved_archive = Path(archive).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid archive path")
+        _assert_fs_path_allowed(resolved_archive)
+        archive = str(resolved_archive)
     if not os.path.isfile(archive):
         raise HTTPException(status_code=404, detail=f"Archive not found: {archive}")
     args = ["import", archive]
@@ -13052,12 +13554,16 @@ def _profile_attr(info, name: str, default: Any = None) -> Any:
 
 
 def _profile_to_dict(info) -> Dict[str, Any]:
+    # 0017: profile records name the model/provider each profile runs on.
+    # Blanked (shape kept) on an isolated dashboard — this is the shared
+    # chokepoint for GET /api/profiles' live path and _fallback_profile_dicts.
+    _hide_model = _model_control_hidden()
     return {
         "name": _profile_attr(info, "name", ""),
         "path": str(_profile_attr(info, "path", "")),
         "is_default": bool(_profile_attr(info, "is_default", False)),
-        "model": _profile_attr(info, "model"),
-        "provider": _profile_attr(info, "provider"),
+        "model": None if _hide_model else _profile_attr(info, "model"),
+        "provider": None if _hide_model else _profile_attr(info, "provider"),
         "has_env": bool(_profile_attr(info, "has_env", False)),
         "skill_count": int(_profile_attr(info, "skill_count", 0) or 0),
         "gateway_running": bool(_profile_attr(info, "gateway_running", False)),
@@ -13124,9 +13630,182 @@ def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
     return profiles
 
 
+def _isolated_profile() -> str:
+    """The profile this server is locked to, or "" for the machine dashboard."""
+    return getattr(app.state, "isolated_profile", "") or ""
+
+
+# --- Owner-dashboard model gating -----------------------------------------
+# On an --isolated (per-owner) dashboard the model is a platform decision and
+# its identity must not leak: refuse every model-selection write and the
+# provider-credential surface, and scrub model identity from the reads that
+# would otherwise expose provider/model names (chat header, Models picker,
+# Config). All no-ops on the machine (non-isolated) dashboard, where full
+# model administration is intended.
+_MODEL_CONFIG_KEYS = frozenset(
+    {"model", "fallback_providers", "delegation", "providers", "auxiliary", "moa"}
+)
+
+# Served in place of the egress/iron-proxy status dump on an isolated
+# dashboard. Says the surface exists and is administered elsewhere; names no
+# provider, host, credential, or model.
+_EGRESS_STATUS_PLATFORM_NOTICE = (
+    "Egress proxy status is managed by the platform."
+)
+
+# Deny-by-default families for the isolated-dashboard provider/config gate
+# (see _isolated_provider_config_gate middleware). Every route under these
+# prefixes is refused on an isolated dashboard — provider identity, custom
+# endpoints (list/create/activate/delete/validate), provider OAuth, and the
+# credential pool are all platform-managed. Refusing by PREFIX (not by
+# enumerated route name) means a new upstream route in the family is denied on
+# arrival instead of shipping ungated.
+_ISOLATED_DENY_PREFIXES = (
+    "/api/providers/",    # provider identity + custom endpoints + provider OAuth
+    "/api/credentials/",  # provider credential pool
+    # Egress/iron-proxy status. ``format_status_text`` enumerates mapped
+    # credential env names, their allowed upstream hosts, redacted tokens, and
+    # the uncovered-provider list — provider/upstream identity by any reading.
+    # Added with the /api/egress/status route itself (upstream shipped it
+    # ungated); the family, not the one route, so the next endpoint upstream
+    # hangs off /api/egress/ is denied on arrival.
+    "/api/egress/",
+)
+# Exact config-mutating routes outside the deny prefixes that must also be
+# refused on an isolated dashboard. ``/api/tools/terminal/backend`` (PUT)
+# selects WHERE agent shell commands execute (pre-audit §6c) — a platform
+# decision. Kept as an explicit (method, path) set so read siblings under the
+# same path (e.g. GET /api/tools/terminal/backends) stay available.
+_ISOLATED_DENY_EXACT = frozenset(
+    {
+        ("PUT", "/api/tools/terminal/backend"),
+    }
+)
+
+
+def _isolated_config_surface_denied(method: str, path: str) -> bool:
+    """True when (method, path) is a provider/credential/config-mutation route
+    that a platform-managed (isolated) dashboard must never reach.
+
+    Deny-by-default over whole route families by prefix, plus a small explicit
+    (method, path) set for config-mutating routes that live outside those
+    prefixes. The caller (_isolated_provider_config_gate) only consults this on
+    an isolated dashboard.
+    """
+    for prefix in _ISOLATED_DENY_PREFIXES:
+        # Match the family root (e.g. exactly "/api/providers") and everything
+        # beneath it.
+        if path == prefix.rstrip("/") or path.startswith(prefix):
+            return True
+    return (method.upper(), path) in _ISOLATED_DENY_EXACT
+
+
+def _model_control_hidden() -> bool:
+    """True when this dashboard must hide/refuse model selection + identity."""
+    return bool(_isolated_profile())
+
+
+def _assert_model_control_allowed() -> None:
+    if _model_control_hidden():
+        raise HTTPException(
+            status_code=403,
+            detail="Model selection is managed by the platform.",
+        )
+
+
+def _assert_credentials_allowed() -> None:
+    if _model_control_hidden():
+        raise HTTPException(
+            status_code=403,
+            detail="Provider credentials are managed by the platform.",
+        )
+
+
+def _assert_no_model_config_write(cfg) -> None:
+    """403 if an isolated dashboard tries to write any model-identity key."""
+    if _model_control_hidden() and isinstance(cfg, dict):
+        if any(key in cfg for key in _MODEL_CONFIG_KEYS):
+            raise HTTPException(
+                status_code=403,
+                detail="Model configuration is managed by the platform.",
+            )
+
+
+def _scrub_model_config_keys(cfg):
+    """Drop model-identity keys from a config mapping when gated."""
+    if _model_control_hidden() and isinstance(cfg, dict):
+        return {k: v for k, v in cfg.items() if k not in _MODEL_CONFIG_KEYS}
+    return cfg
+
+
+def _scrub_model_config_yaml(text: str) -> str:
+    """Strip model-identity keys from raw config YAML when gated.
+
+    Best-effort: if the document does not parse, return a neutral placeholder
+    rather than risk leaking identity via the raw text.
+    """
+    if not _model_control_hidden():
+        return text
+    try:
+        parsed = yaml.safe_load(text)
+    except Exception:
+        return "# Model configuration is managed by the platform.\n"
+    if not isinstance(parsed, dict):
+        return text
+    stripped = {k: v for k, v in parsed.items() if k not in _MODEL_CONFIG_KEYS}
+    return yaml.safe_dump(stripped, default_flow_style=False, sort_keys=False)
+
+
+def _assert_profile_allowed(name: str) -> None:
+    """Refuse any profile except this instance's own when running --isolated.
+
+    A dashboard launched with ``serve --isolated`` for profile X answers ONLY
+    for X. A request naming any OTHER profile (via ``?profile=`` or a JSON
+    body ``profile`` field) is refused with 403, so an owner paired to one
+    profile's backend can never pivot to a sibling's config / secrets /
+    sessions. No-op when not isolated (the machine dashboard), so all-profiles
+    management is unchanged.
+
+    This is the single named-profile chokepoint: it is called from
+    ``_resolve_profile_dir`` (which ``_profile_scope`` / ``_config_profile_scope``
+    and nearly every profile-scoped endpoint route through) and from the one
+    endpoint that re-implements name validation directly (``_cron_profile_home``).
+    ``None`` / ``""`` / ``"current"`` never reach here — those resolve to the
+    instance's own HERMES_HOME without a named lookup.
+    """
+    iso = _isolated_profile()
+    if not iso:
+        return
+    from hermes_cli import profiles as profiles_mod
+    try:
+        requested = profiles_mod.normalize_profile_name(name)
+    except Exception:
+        requested = (name or "").strip()
+    if requested and requested != iso:
+        raise HTTPException(
+            status_code=403,
+            detail="This dashboard is scoped to a single profile.",
+        )
+
+
+def _filter_isolated_profile_records(records):
+    """Trim an all-profiles enumeration to just this instance's profile.
+
+    Enumeration endpoints (``GET /api/profiles``, the cron profile dropdown)
+    scan the machine-global profiles root, which would otherwise disclose the
+    NAMES + metadata of sibling profiles to an isolated owner. When isolated,
+    keep only the record whose ``name`` matches; otherwise pass through.
+    """
+    iso = _isolated_profile()
+    if not iso:
+        return records
+    return [r for r in records if (r or {}).get("name") == iso]
+
+
 def _resolve_profile_dir(name: str) -> Path:
     """Validate ``name`` and resolve to its directory or raise an HTTPException."""
     from hermes_cli import profiles as profiles_mod
+    _assert_profile_allowed(name)
     try:
         profiles_mod.validate_profile_name(name)
     except ValueError as e:
@@ -13721,7 +14400,8 @@ async def get_config_raw(profile: Optional[str] = None):
         path = get_config_path()
     if not path.exists():
         return {"yaml": "", "path": str(path)}
-    return {"yaml": path.read_text(encoding="utf-8"), "path": str(path)}
+    _raw = _scrub_model_config_yaml(path.read_text(encoding="utf-8"))
+    return {"yaml": _raw, "path": str(path)}
 
 
 @app.put("/api/config/raw")
@@ -13730,6 +14410,7 @@ async def update_config_raw(body: RawConfigUpdate, profile: Optional[str] = None
         parsed = yaml.safe_load(body.yaml_text)
         if not isinstance(parsed, dict):
             raise HTTPException(status_code=400, detail="YAML must be a mapping")
+        _assert_no_model_config_write(parsed)
         with _profile_scope(body.profile or profile):
             # Full-document replacement: the editor owns the whole file; do not
             # merge omitted sections back from disk (#62723).
@@ -13856,7 +14537,7 @@ def _aux_task_summary(aux_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
     from agent.insights import InsightsEngine
 
-    db = _open_session_db_for_profile(profile)
+    db = _open_session_db_for_profile(profile, read_only=True)
     try:
         cutoff = time.time() - (days * 86400)
         cur = db._conn.execute("""
@@ -13885,6 +14566,9 @@ def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
             GROUP BY model ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
         """, (cutoff,))
         by_model = [dict(r) for r in cur2.fetchall()]
+        if _model_control_hidden():
+            for _row in by_model:
+                _row["model"] = ""
 
         # Fold in auxiliary usage (vision, compression, title_generation, ...)
         # recorded per (model, task) in session_model_usage. Aux calls never
@@ -13906,16 +14590,7 @@ def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
             FROM sessions WHERE started_at > ?
         """, (cutoff,))
         totals = dict(cur3.fetchone())
-        insights_report = InsightsEngine(db).generate(days=days)
-        skills = insights_report.get("skills", {
-            "summary": {
-                "total_skill_loads": 0,
-                "total_skill_edits": 0,
-                "total_skill_actions": 0,
-                "distinct_skills_used": 0,
-            },
-            "top_skills": [],
-        })
+        usage = InsightsEngine(db).get_usage_breakdown(days=days)
 
         return {
             "daily": daily,
@@ -13925,17 +14600,24 @@ def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
             "by_task": _aux_task_summary(aux_rows),
             "totals": totals,
             "period_days": days,
-            "skills": skills,
+            "skills": usage["skills"],
             # Per-tool-name call counts (already computed by InsightsEngine);
             # the desktop Capabilities page aggregates these per toolset.
-            "tools": insights_report.get("tools", []),
+            "tools": usage["tools"],
         }
     finally:
         db.close()
 
 
 @app.get("/api/analytics/usage")
-async def get_usage_analytics(days: int = 30, profile: Optional[str] = None):
+async def get_usage_analytics(
+    days: int = Query(30, ge=1, le=365),
+    profile: Optional[str] = None,
+):
+    """``days`` is clamped to 1-365 (idea from #74778): huge or non-positive
+    values would force expensive full-history SQL and InsightsEngine work, or
+    produce empty/inverted time windows. The UI only offers 7/30/90-day
+    presets."""
     return await asyncio.to_thread(_get_usage_analytics, days, profile)
 
 
@@ -13945,7 +14627,8 @@ def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
     Returns token/cost/session breakdown per model plus capability metadata
     from models.dev (context window, vision, tools, reasoning, etc.).
     """
-    db = _open_session_db_for_profile(profile)
+    _assert_model_control_allowed()
+    db = _open_session_db_for_profile(profile, read_only=True)
     try:
         cutoff = time.time() - (days * 86400)
 
@@ -14116,7 +14799,11 @@ def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
 
 
 @app.get("/api/analytics/models")
-async def get_models_analytics(days: int = 30, profile: Optional[str] = None):
+async def get_models_analytics(
+    days: int = Query(30, ge=1, le=365),
+    profile: Optional[str] = None,
+):
+    # ``days`` clamped to 1-365 (idea from #74778) — see get_usage_analytics.
     """Return model analytics without blocking the serving event loop."""
     return await asyncio.to_thread(_get_models_analytics, days, profile)
 
@@ -14588,7 +15275,8 @@ def _resolve_chat_argv(
 
     if resume:
         _resume_db = _open_session_db_for_profile(
-            requested if profile_dir is not None else None
+            requested if profile_dir is not None else None,
+            read_only=True,
         )
         try:
             latest_resume, _latest_path = _session_latest_descendant(resume, _resume_db)
@@ -15757,6 +16445,14 @@ def _render_active_theme_bootstrap_css() -> str:
         return ""
 
 
+# Hashed bundle assets (``/assets/<name>-<contenthash>.<ext>``) are immutable
+# by construction: any content change produces a new filename, and the entry
+# point (index.html) is served ``no-store`` so it always references the
+# current hashes. A year-long immutable cache lets browsers skip even the
+# revalidation round-trip on every dashboard load.
+_IMMUTABLE_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
+
 def mount_spa(application: FastAPI):
     """Mount the built SPA. Falls back to index.html for client-side routing.
 
@@ -15852,6 +16548,17 @@ def mount_spa(application: FastAPI):
         theme_bootstrap = _render_active_theme_bootstrap_css()
         if theme_bootstrap:
             html = html.replace("</head>", f"{theme_bootstrap}</head>", 1)
+        if _model_control_hidden():
+            _notice = (
+                '<div style="position:fixed;left:0;right:0;bottom:0;'
+                'z-index:2147483647;padding:4px 10px;text-align:center;'
+                'font:12px/1.4 system-ui,-apple-system,sans-serif;color:#b9a94a;'
+                'background:rgba(28,28,20,.94);'
+                'border-top:1px solid rgba(185,169,74,.4);pointer-events:none;">'
+                'Model is managed by the platform \u00b7 A/B/C evaluations may be active'
+                '</div>'
+            )
+            html = html.replace("</body>", f"{_notice}</body>", 1)
         html = html.replace("</head>", f"{bootstrap_script}</head>", 1)
         return HTMLResponse(
             html,
@@ -15879,9 +16586,32 @@ def mount_spa(application: FastAPI):
                 css = css.replace(f"url({asset_dir}", f"url({prefix}{asset_dir}")
                 css = css.replace(f"url(\"{asset_dir}", f"url(\"{prefix}{asset_dir}")
                 css = css.replace(f"url('{asset_dir}", f"url('{prefix}{asset_dir}")
-        return Response(content=css, media_type="text/css")
+        return Response(
+            content=css,
+            media_type="text/css",
+            headers={"Cache-Control": _IMMUTABLE_ASSET_CACHE_CONTROL},
+        )
 
-    application.mount("/assets", StaticFiles(directory=WEB_DIST / "assets"), name="assets")
+    class _ImmutableAssetFiles(StaticFiles):
+        """StaticFiles that marks hashed bundle assets immutable.
+
+        Everything under ``/assets/`` carries a Vite content hash in its
+        filename, so a given URL's bytes can never change — a rebuild
+        produces a NEW filename referenced by a fresh (``no-store``)
+        index.html. Without this header every dashboard load re-validated
+        each chunk; with it the browser serves reloads straight from its
+        HTTP cache.
+        """
+
+        async def get_response(self, path: str, scope):
+            response = await super().get_response(path, scope)
+            if response.status_code == 200:
+                response.headers["Cache-Control"] = _IMMUTABLE_ASSET_CACHE_CONTROL
+            return response
+
+    application.mount(
+        "/assets", _ImmutableAssetFiles(directory=WEB_DIST / "assets"), name="assets"
+    )
 
     @application.get("/{full_path:path}")
     async def serve_spa(full_path: str, request: Request):
@@ -16465,8 +17195,75 @@ def _strip_dashboard_manifest(p: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in p.items() if not k.startswith("_")}
 
 
-def _merged_plugins_hub() -> Dict[str, Any]:
-    """Agent discovery + dashboard manifests + optional provider picker metadata."""
+_PLUGINS_HUB_CACHE_TTL_SECONDS = 5.0
+_plugins_hub_cache: Optional[Dict[str, Any]] = None
+_plugins_hub_cache_expires_at = 0.0
+_plugins_hub_cache_lock = threading.Lock()
+
+
+def _invalidate_plugins_hub_cache() -> None:
+    global _plugins_hub_cache, _plugins_hub_cache_expires_at
+    with _plugins_hub_cache_lock:
+        _plugins_hub_cache = None
+        _plugins_hub_cache_expires_at = 0.0
+
+
+_plugins_hub_probe_inflight: set = set()
+_plugins_hub_probe_lock = threading.Lock()
+
+
+def _schedule_check_fn_probe(fn) -> Optional[threading.Thread]:
+    """Warm a cold ``check_fn`` verdict off the request path.
+
+    The hub read path only consumes cached availability (never probes
+    inline). But the only other warmer lives in the tool-schema build, which
+    a dashboard-only session never runs — so a cold cache would report
+    ``auth_required=False`` forever. Kick a daemon-thread probe on the miss;
+    the short hub TTL picks up the verdict on the next fetch. Deduplicates
+    concurrent probes per function. Returns the spawned thread (or ``None``
+    when a probe for *fn* is already in flight).
+    """
+    with _plugins_hub_probe_lock:
+        if fn in _plugins_hub_probe_inflight:
+            return None
+        _plugins_hub_probe_inflight.add(fn)
+
+    def _probe():
+        try:
+            from tools.registry import _check_fn_cached
+
+            _check_fn_cached(fn)
+        except Exception:
+            pass
+        finally:
+            with _plugins_hub_probe_lock:
+                _plugins_hub_probe_inflight.discard(fn)
+
+    thread = threading.Thread(
+        target=_probe, name="plugins-hub-checkfn-probe", daemon=True
+    )
+    thread.start()
+    return thread
+
+
+def _merged_plugins_hub(force_refresh: bool = False) -> Dict[str, Any]:
+    """Agent discovery + dashboard manifests + optional provider picker metadata.
+
+    IMPORTANT: this powers a dashboard request path, so it must stay read-only
+    and cheap. In particular, do not execute tool ``check_fn`` probes here —
+    those can trigger imports, auth/network checks, and other synchronous work
+    that starves the root event loop. We only consume last-known cached tool
+    availability, and we memoize the assembled payload briefly to collapse the
+    dashboard's bursty duplicate fetches.
+    """
+    global _plugins_hub_cache, _plugins_hub_cache_expires_at
+    now = time.monotonic()
+    if not force_refresh:
+        with _plugins_hub_cache_lock:
+            if _plugins_hub_cache is not None and now < _plugins_hub_cache_expires_at:
+                return _plugins_hub_cache
+
+    started_at = time.monotonic()
     from hermes_cli.plugins_cmd import (
         _discover_all_plugins,
         _get_current_context_engine,
@@ -16519,17 +17316,30 @@ def _merged_plugins_hub() -> Dict[str, Any]:
             source in {"user", "git"} and under_user_tree and Path(dir_str).is_dir()
         )
 
-        # Check if this plugin provides tools that require auth
+        # Read-only auth hint: consult only last-known cached tool availability.
+        # A missing cache entry is treated as "unknown" rather than triggering a
+        # live probe inside this request path.
         auth_required = False
         auth_command = ""
         manifest_data = _read_plugin_manifest_at(dir_path)
         provides_tools = manifest_data.get("provides_tools") or []
         if provides_tools:
             try:
-                from tools.registry import registry
+                from tools.registry import get_cached_check_fn_result, registry
                 for tname in provides_tools:
                     entry = registry.get_entry(tname)
-                    if entry and entry.check_fn and not entry.check_fn():
+                    if not entry or not entry.check_fn:
+                        continue
+                    cached_result = get_cached_check_fn_result(entry.check_fn)
+                    if cached_result is None:
+                        # Cold cache: nothing else warms check_fns on
+                        # dashboard-only sessions, so kick a background
+                        # probe; the short hub TTL surfaces the verdict on
+                        # the next fetch instead of pinning auth_required
+                        # to False forever.
+                        _schedule_check_fn_probe(entry.check_fn)
+                        continue
+                    if cached_result is False:
                         auth_required = True
                         auth_command = f"hermes auth {name}"
                         break
@@ -16568,7 +17378,7 @@ def _merged_plugins_hub() -> Dict[str, Any]:
     except Exception:
         context_engines = []
 
-    return {
+    payload = {
         "plugins": rows,
         "orphan_dashboard_plugins": orphan_dashboard,
         "providers": {
@@ -16578,6 +17388,18 @@ def _merged_plugins_hub() -> Dict[str, Any]:
             "context_options": context_engines,
         },
     }
+    duration = time.monotonic() - started_at
+    if duration >= 0.25:
+        _log.info(
+            "plugins/hub rebuilt in %.3fs (plugins=%d memory_options=%d)",
+            duration,
+            len(rows),
+            len(memory_providers),
+        )
+    with _plugins_hub_cache_lock:
+        _plugins_hub_cache = payload
+        _plugins_hub_cache_expires_at = time.monotonic() + _PLUGINS_HUB_CACHE_TTL_SECONDS
+    return payload
 
 
 @app.get("/api/dashboard/plugins/hub")
@@ -16607,6 +17429,7 @@ async def post_agent_plugin_install(request: Request, body: _AgentPluginInstallB
             detail=result.get("error") or "Install failed.",
         )
     _get_dashboard_plugins(force_rescan=True)
+    _invalidate_plugins_hub_cache()
     # Strip internal paths from the response
     result.pop("after_install_path", None)
     return result
@@ -16629,6 +17452,7 @@ async def post_agent_plugin_enable(request: Request, name: str):
     result = dashboard_set_agent_plugin_enabled(name, enabled=True)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Enable failed.")
+    _invalidate_plugins_hub_cache()
     return result
 
 
@@ -16641,6 +17465,7 @@ async def post_agent_plugin_disable(request: Request, name: str):
     result = dashboard_set_agent_plugin_enabled(name, enabled=False)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Disable failed.")
+    _invalidate_plugins_hub_cache()
     return result
 
 
@@ -16654,6 +17479,7 @@ async def post_agent_plugin_update(request: Request, name: str):
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Update failed.")
     _get_dashboard_plugins(force_rescan=True)
+    _invalidate_plugins_hub_cache()
     return result
 
 
@@ -16667,6 +17493,7 @@ async def delete_agent_plugin(request: Request, name: str):
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Remove failed.")
     _get_dashboard_plugins(force_rescan=True)
+    _invalidate_plugins_hub_cache()
     return result
 
 
@@ -16685,6 +17512,7 @@ async def put_plugin_providers(request: Request, body: _PluginProvidersPutBody):
         _save_memory_provider(memory_provider)
     if body.context_engine is not None:
         _save_context_engine(body.context_engine)
+    _invalidate_plugins_hub_cache()
     return {"ok": True}
 
 
@@ -16708,6 +17536,7 @@ async def post_plugin_visibility(request: Request, name: str, body: _PluginVisib
 
     config["dashboard"]["hidden_plugins"] = hidden_list
     save_config(config)
+    _invalidate_plugins_hub_cache()
     return {"ok": True, "name": name, "hidden": body.hidden}
 
 
@@ -17030,6 +17859,7 @@ def start_server(
     headless: bool = False,
     ssh_session_token: Optional[str] = None,
     ssh_owner_nonce: Optional[str] = None,
+    isolated_profile: str = "",
 ):
     """Start the web UI server.
 
@@ -17037,6 +17867,15 @@ def start_server(
     URL as ``?profile=<name>`` so the SPA's profile switcher preselects it
     — used when a profile alias (``<profile> dashboard``) routes to the
     machine dashboard.
+
+    ``isolated_profile`` (when set) locks this server instance to a SINGLE
+    named profile: it is stored on ``app.state.isolated_profile`` and every
+    named-profile resolution / enumeration path refuses any OTHER profile
+    with 403 (see ``_assert_profile_allowed``). This is what makes
+    ``serve --isolated`` a real access-control boundary — without it, a
+    per-request ``?profile=<other>`` would resolve a sibling profile's dir
+    from the machine-global profiles root. Empty string = the all-profiles
+    machine dashboard (unchanged behaviour).
 
     ``headless`` is the ``serve`` path: the JSON-RPC/WS backend with no UI
     build and no SPA mount (mount_spa() honours ``HERMES_SERVE_HEADLESS``), so
@@ -17062,6 +17901,24 @@ def start_server(
     # uses this to decide whether to refuse the bind, log the gate-on
     # banner, and enable uvicorn proxy_headers.
     app.state.auth_required = should_require_auth(host)
+
+    # Lock this instance to a single profile when launched with --isolated.
+    # Stored here (not just on the CLI) so the request-path resolver /
+    # enumeration gates can enforce it. "" = all-profiles machine dashboard.
+    from hermes_cli import profiles as _profiles_mod
+    try:
+        app.state.isolated_profile = (
+            _profiles_mod.normalize_profile_name(isolated_profile)
+            if isolated_profile else ""
+        )
+    except Exception:
+        app.state.isolated_profile = (isolated_profile or "").strip()
+    if app.state.isolated_profile:
+        _log.info(
+            "Dashboard is ISOLATED to profile %r — requests naming any other "
+            "profile will be refused with 403.",
+            app.state.isolated_profile,
+        )
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
     # the hermes-0day MCP-persistence campaign abused unauthenticated public
@@ -17095,6 +17952,17 @@ def start_server(
                 if _nous_plugin.LAST_SKIP_REASON:
                     skip_reasons.append(
                         f"  • nous: {_nous_plugin.LAST_SKIP_REASON}"
+                    )
+            except Exception:
+                pass
+            try:
+                import sys as _sys
+
+                _dr = _sys.modules.get("hermes_plugins.cv_dashboard_desktop_remote")
+                _dr_reason = getattr(_dr, "LAST_SKIP_REASON", "")
+                if _dr_reason:
+                    skip_reasons.append(
+                        f"  • desktop-remote: {_dr_reason}"
                     )
             except Exception:
                 pass

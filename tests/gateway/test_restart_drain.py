@@ -102,6 +102,9 @@ async def test_request_restart_is_idempotent():
     assert runner._restart_task is not None
     assert runner._restart_task not in runner._background_tasks
     assert runner.request_restart(detached=True, via_service=False) is False
+    # In-band restart marks draining immediately so new turns are refused
+    # while any after-turn wait runs (#77184).
+    assert runner._draining is True
 
     await runner._restart_task
 
@@ -109,6 +112,69 @@ async def test_request_restart_is_idempotent():
     runner.stop.assert_awaited_once_with(
         restart=True, detached_restart=True, service_restart=False
     )
+
+
+@pytest.mark.asyncio
+async def test_request_restart_defers_stop_until_active_turn_finishes():
+    """Regression for #77184: requesting turn must not enter the drain set."""
+    runner, _adapter = make_restart_runner()
+    runner.stop = AsyncMock()
+    runner._launch_detached_restart_command = AsyncMock()
+    runner._restart_after_turn_timeout = 5.0
+    session_key = "agent:main:telegram:dm:123"
+    runner._running_agents[session_key] = MagicMock()
+
+    assert runner.request_restart(detached=False, via_service=True) is True
+    assert runner._draining is True
+
+    # While the requesting turn is still active, stop() must not run.
+    await asyncio.sleep(0.25)
+    runner.stop.assert_not_awaited()
+    assert session_key in runner._running_agents
+
+    # Turn finishes → restart proceeds immediately (drain set empty).
+    del runner._running_agents[session_key]
+    await runner._restart_task
+
+    runner.stop.assert_awaited_once_with(
+        restart=True, detached_restart=False, service_restart=True
+    )
+    # Detached helper is only for the non-service path.
+    runner._launch_detached_restart_command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_request_restart_after_turn_timeout_zero_enters_stop_immediately():
+    """restart_after_turn_timeout=0 preserves legacy immediate drain."""
+    runner, _adapter = make_restart_runner()
+    runner.stop = AsyncMock()
+    runner._restart_after_turn_timeout = 0.0
+    runner._running_agents["agent:main:telegram:dm:1"] = MagicMock()
+
+    assert runner.request_restart(detached=False, via_service=True) is True
+    await runner._restart_task
+
+    runner.stop.assert_awaited_once_with(
+        restart=True, detached_restart=False, service_restart=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_restart_after_turn_cap_elapsed_still_calls_stop():
+    """Safety valve: wedged turns cannot pin the gateway forever."""
+    runner, _adapter = make_restart_runner()
+    runner.stop = AsyncMock()
+    runner._restart_after_turn_timeout = 0.2
+    runner._running_agents["agent:main:telegram:dm:1"] = MagicMock()
+
+    assert runner.request_restart(detached=False, via_service=True) is True
+    await runner._restart_task
+
+    runner.stop.assert_awaited_once_with(
+        restart=True, detached_restart=False, service_restart=True
+    )
+    # Agent was still present — stop() owns the interrupt path from here.
+    assert runner._running_agents
 
 
 @pytest.mark.asyncio
@@ -236,6 +302,50 @@ async def test_windows_detached_restart_watcher_keeps_console_python(monkeypatch
 
 
 # ── Shutdown notification tests ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_slack_lifecycle_home_only_routes_active_session_to_home(monkeypatch):
+    """Slack lifecycle pings can be routed to the control/home channel only."""
+    from gateway.config import HomeChannel, Platform, PlatformConfig
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms = {
+        Platform.SLACK: PlatformConfig(
+            enabled=True,
+            token="***",
+            home_channel=HomeChannel(
+                platform=Platform.SLACK,
+                chat_id="control-room",
+                name="eng-control-room",
+            ),
+        )
+    }
+    runner.adapters = {Platform.SLACK: adapter}
+
+    source = make_restart_source(chat_id="work-channel", chat_type="channel")
+    source.platform = Platform.SLACK
+    session_key = build_session_key(source)
+    runner._running_agents[session_key] = MagicMock()
+    runner.session_store._entries = {
+        session_key: SessionEntry(
+            session_key=session_key,
+            session_id="sess-1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=source.platform,
+            chat_type=source.chat_type,
+        )
+    }
+    monkeypatch.setenv("SLACK_GATEWAY_LIFECYCLE_HOME_ONLY", "true")
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    sent_chat_ids = {chat_id for chat_id, _content, _meta in adapter.sent_calls}
+    assert sent_chat_ids == {"control-room"}
+    assert len(adapter.sent) == 1
+    assert "shutting down" in adapter.sent[0]
 
 
 @pytest.mark.asyncio

@@ -133,9 +133,148 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+
+
+def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
+    """Normalize a per-task reasoning effort into a storable level.
+
+    Accepts any level in ``hermes_constants.VALID_REASONING_EFFORTS`` plus
+    ``"none"`` (thinking disabled), case-insensitively. Empty / None means
+    "inherit the worker profile's own ``agent.reasoning_effort``" and stores
+    NULL. Anything else is rejected rather than silently dropped — a typo'd
+    level must not quietly hand the task back to the profile default.
+    """
+    from hermes_constants import VALID_REASONING_EFFORTS
+
+    value = str(effort or "").strip().lower()
+    if not value:
+        return None
+    if value == "none" or value in VALID_REASONING_EFFORTS:
+        return value
+    allowed = ", ".join(("none", *VALID_REASONING_EFFORTS))
+    raise ValueError(
+        f"reasoning_effort must be one of {allowed}, got {effort!r}"
+    )
+
+
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+
+WORKTREE_KIND = "worktree"
+
+
+def _path_is_git_repo(path: Optional[str]) -> bool:
+    """True if *path* is (or is) a git working tree or a bare repo.
+
+    Cheap filesystem probe — no subprocess. A worktree card branches from this
+    directory, so it must resolve to something git can operate on: a dir
+    containing ``.git`` (normal or linked worktree), or a bare repo (``HEAD`` +
+    ``objects``). We deliberately do NOT shell out to ``git rev-parse`` so the
+    check stays pure, fast, and usable in the mint path.
+    """
+    if not path:
+        return False
+    try:
+        p = Path(path).expanduser()
+    except (ValueError, OSError):
+        return False
+    if not p.is_dir():
+        return False
+    if (p / ".git").exists():
+        return True
+    # Bare repo shape.
+    return (p / "HEAD").is_file() and (p / "objects").is_dir()
+
+
+def _worktree_workspace_path_resolvable(workspace_path: Optional[str]) -> bool:
+    """A worktree ``workspace_path`` git can actually create a worktree at.
+
+    Non-empty is necessary but NOT sufficient — a garbage/relative/nonexistent
+    path is just as un-dispatchable as an empty one. Mirror what
+    ``_resolve_worktree_workspace`` actually does with an explicit path: the
+    target is dispatchable iff it is already a linked worktree checkout, iff it
+    is itself a git repo root, or iff walking up from its nearest existing
+    ancestor finds a git repo (``_repo_root_for_worktree_target``). A path with
+    no git repo anywhere in its ancestry can only ``spawn_failed`` at dispatch.
+    """
+    if not workspace_path or not workspace_path.strip():
+        return False
+    raw = workspace_path.strip()
+    # Relative paths are rejected at dispatch by resolve_workspace; treat them
+    # as un-resolvable at mint time too.
+    if not os.path.isabs(raw):
+        return False
+    try:
+        requested = Path(raw).expanduser()
+    except (ValueError, OSError):
+        return False
+    if _path_is_git_repo(raw):
+        return True
+    # Walk up from the nearest existing ancestor looking for a git repo, exactly
+    # as _repo_root_for_worktree_target does at dispatch. No subprocess: a git
+    # repo root/worktree carries a ``.git`` entry (or bare-repo HEAD+objects).
+    try:
+        current: Optional[Path] = requested
+        while current is not None:
+            if current.exists():
+                probe: Optional[Path] = current
+                while probe is not None:
+                    if _path_is_git_repo(str(probe)):
+                        return True
+                    probe = probe.parent if probe != probe.parent else None
+                return False
+            current = current.parent if current != current.parent else None
+    except (ValueError, OSError):
+        return False
+    return False
+
+
+def worktree_mint_is_broken(
+    workspace_kind: Optional[str],
+    workspace_path: Optional[str],
+    board_default_workdir: Optional[str],
+) -> Optional[str]:
+    """Return a reason string if a worktree mint can never dispatch, else None.
+
+    A ``workspace_kind=worktree`` card is dispatchable only if EITHER:
+      * ``workspace_path`` is a non-empty, absolute, resolvable path (a git
+        repo, or a path whose parent dir exists so git can create the worktree
+        there), OR
+      * the board carries a ``default_workdir`` that is itself a git repo (the
+        dispatcher falls back to it when the card omits a path).
+
+    Non-worktree kinds (scratch, dir, unset) are never flagged here — scratch is
+    the safe default and ``dir`` has its own absolute-path rule. Returns None
+    (OK) for those.
+
+    Mirrors ``coord/card_mint_guard.worktree_mint_is_broken`` in the pantheon
+    repo; inlined here (no pantheon import) so the reject fires for the raw
+    ``kanban_create`` tool / CLI path that pantheon's mint helpers cannot wrap.
+    """
+    kind = (workspace_kind or "").strip().lower()
+    if kind != WORKTREE_KIND:
+        return None
+    if _worktree_workspace_path_resolvable(workspace_path):
+        return None
+    if board_default_workdir and _path_is_git_repo(board_default_workdir):
+        return None
+    path_desc = (
+        "empty" if not (workspace_path or "").strip()
+        else f"unresolvable ({workspace_path!r})"
+    )
+    workdir_desc = (
+        "null" if not (board_default_workdir or "").strip()
+        else f"not a git repo ({board_default_workdir!r})"
+    )
+    return (
+        f"workspace_kind=worktree with {path_desc} workspace_path and a board "
+        f"default_workdir that is {workdir_desc} — the card can never dispatch "
+        f"(a worktree needs a git repo to branch from). Provide a non-empty "
+        f"resolvable workspace_path or set the board's default_workdir to a git "
+        f"repo, or use workspace_kind=scratch."
+    )
+
 
 
 def _assert_not_delegated_child_mutation() -> None:
@@ -256,6 +395,34 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # conventional "temporary failure, retry later" code, and well clear of the
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
+
+# Sentinel exit code a kanban worker uses to signal "a plugin policy
+# hard-stopped my run" — a tripped cost cap or circuit breaker, not a task
+# failure and not a transient throttle. The dispatcher maps it to a
+# ``hard_stop`` exit kind: ``detect_crashed_workers`` routes the task to
+# ``blocked`` with a STICKY ``hard_stop`` event (a human decides whether to
+# raise the budget or split the work) WITHOUT counting a failure and WITHOUT
+# a respawn — ``recompute_ready`` honors the stickiness in the SAME dispatch
+# tick, so the card cannot bounce straight back into the cap. Before this
+# existed, a cost-cap trip vetoed the worker's own ``kanban_complete`` /
+# ``kanban_block`` calls, so the worker exited rc=0 with the task still
+# ``running`` → recorded as a protocol violation → respawned into the same
+# cap. 77 == BSD ``EX_NOPERM`` (sysexits.h): the run was denied by policy.
+KANBAN_HARD_STOP_EXIT_CODE = 77
+
+
+# Signals that mean "gracefully asked to stop", NOT "the task failed".
+# A worker reaped as killed by one of these was almost certainly torn down
+# by systemd on a unit stop/restart (deploy, cv-hermes-update, operator
+# `systemctl restart`) or Ctrl-C'd from a parent shell — an infrastructure
+# event, not a task-logic failure. ``detect_crashed_workers`` releases such
+# tasks back to ``ready`` WITHOUT counting a failure (like the rate-limit
+# carve-out) so one restart window can't trip the circuit breaker and park an
+# otherwise-healthy card. Genuine crash signals (SIGKILL from the OOM killer,
+# SIGSEGV, SIGABRT, SIGBUS, SIGFPE, …) are deliberately EXCLUDED and still
+# count. SIGTERM==15, SIGINT==2 on every POSIX platform; hardcode so the set
+# is importable without a `signal` module dependency at module load.
+_GRACEFUL_TERMINATION_SIGNALS = frozenset({15, 2})  # SIGTERM, SIGINT
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -673,6 +840,11 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "icon": "",
         "color": "",
         "default_workdir": None,
+        # Optional first-class Project this board is scoped to. When set, new
+        # tasks inherit it (deterministic worktree + branch under the project's
+        # primary repo) and ``default_workdir`` mirrors the project's primary
+        # path so the persistent-workspace inheritance path keeps working.
+        "project_id": None,
         "created_at": None,
         "archived": False,
     }
@@ -700,11 +872,16 @@ def write_board_metadata(
     color: Optional[str] = None,
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
+    project_id: Optional[str] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
     Preserves any existing fields not mentioned in the call. Sets
     ``created_at`` on first write. Returns the resulting metadata dict.
+
+    ``project_id``: ``None`` leaves it unchanged; empty string clears the
+    project scope; a value sets it (not validated here — the caller resolves
+    it against ``projects_db``).
     """
     _assert_not_delegated_child_mutation()
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
@@ -724,6 +901,8 @@ def write_board_metadata(
         meta["archived"] = bool(archived)
     if default_workdir is not None:
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
+    if project_id is not None:
+        meta["project_id"] = str(project_id) if project_id else None
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -744,6 +923,7 @@ def create_board(
     icon: Optional[str] = None,
     color: Optional[str] = None,
     default_workdir: Optional[str] = None,
+    project_id: Optional[str] = None,
 ) -> dict:
     """Create a new board directory + DB + metadata. Idempotent.
 
@@ -761,6 +941,7 @@ def create_board(
         icon=icon,
         color=color,
         default_workdir=default_workdir,
+        project_id=project_id,
     )
     # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
@@ -915,6 +1096,12 @@ class Task:
     # model (pre-existing behaviour). Solves the "model from provider A,
     # profile configured for provider B" mismatch class.
     provider_override: Optional[str] = None
+    # Per-task reasoning effort for the worker (one of
+    # ``hermes_constants.VALID_REASONING_EFFORTS``, or ``"none"`` for thinking
+    # off). When set, the dispatcher passes ``--reasoning <level>`` so the
+    # worker runs at that depth regardless of the profile's
+    # ``agent.reasoning_effort``. NULL = the worker profile's own setting.
+    reasoning_effort: Optional[str] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -1016,6 +1203,11 @@ class Task:
             provider_override=(
                 row["provider_override"]
                 if "provider_override" in keys and row["provider_override"]
+                else None
+            ),
+            reasoning_effort=(
+                row["reasoning_effort"]
+                if "reasoning_effort" in keys and row["reasoning_effort"]
                 else None
             ),
             max_retries=(
@@ -1186,6 +1378,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- worker resolves the model against the right backend instead of the
     -- profile's configured provider. NULL = profile provider.
     provider_override    TEXT,
+    -- Per-task reasoning effort for the worker (minimal|low|medium|high|
+    -- xhigh|max|ultra, or 'none' for thinking off). When set, the dispatcher
+    -- passes --reasoning <level> so the worker runs at that depth regardless
+    -- of the profile's agent.reasoning_effort. NULL = profile setting.
+    reasoning_effort     TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -2374,6 +2571,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "provider_override", "provider_override TEXT"
         )
 
+    if "reasoning_effort" not in cols:
+        # Per-task thinking depth for the worker. NULL = the worker profile's
+        # own agent.reasoning_effort, which is what existing rows were getting.
+        _add_column_if_missing(
+            conn, "tasks", "reasoning_effort", "reasoning_effort TEXT"
+        )
+
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
         # default) = classic single-shot worker, preserving the behaviour
@@ -2837,6 +3041,7 @@ def create_task(
     max_retries: Optional[int] = None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
@@ -2873,6 +3078,11 @@ def create_task(
     config — passed to the worker as ``-m <model> [--provider <name>]``.
     ``provider_override`` requires ``model_override``.
 
+    ``reasoning_effort`` pins the worker's thinking depth for this task
+    (``minimal``…``ultra``, or ``none`` to disable thinking), passed as
+    ``--reasoning <level>``. It is independent of ``model_override``: a task
+    can run the profile's own model at a different depth.
+
     ``project_source_task_id`` is an internal cross-profile fallback for a
     worker-created child. When the active profile cannot resolve ``project_id``
     in its own projects.db, a matching canonical project-linked task in this
@@ -2881,6 +3091,7 @@ def create_task(
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
+    reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -2899,6 +3110,18 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+
+    # Inherit the board's scoped project when the caller didn't name one, so a
+    # project-scoped board anchors every new task to that project's repo
+    # (deterministic worktree + branch) without each surface repeating it.
+    if project_id is None:
+        try:
+            _bmeta = read_board_metadata(board if board else get_current_board())
+            _board_project = (_bmeta.get("project_id") or "").strip()
+            if _board_project:
+                project_id = _board_project
+        except Exception:
+            pass
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -3062,6 +3285,7 @@ def create_task(
     # task would point cleanup at the user's source tree (#28818). The
     # containment guard in ``_cleanup_workspace`` is the safety rail, but
     # we also stop the bad state from being created in the first place.
+    board_default_workdir: Optional[str] = None
     if (
         workspace_path is None
         and project_repo is None
@@ -3071,7 +3295,32 @@ def create_task(
         board_meta = read_board_metadata(board_slug)
         board_default = board_meta.get("default_workdir")
         if board_default:
-            workspace_path = str(board_default)
+            board_default_workdir = str(board_default)
+            workspace_path = board_default_workdir
+
+    # Reject an un-dispatchable worktree mint at the source (loud, no row
+    # written). A ``workspace_kind=worktree`` card needs a git repo to branch
+    # from: without a resolvable explicit ``workspace_path`` AND without a
+    # git-repo board ``default_workdir`` to fall back to, dispatch can only
+    # ``spawn_failed`` until the breaker trips and parks the card silently
+    # blocked. Project-linked worktrees (``project_repo`` set) are exempt: their
+    # concrete path is derived from the project's primary repo inside the insert
+    # loop below, so ``workspace_path`` is legitimately still None here. This is
+    # the mint-gate counterpart to the pantheon card_mint_guard, covering the
+    # raw kanban_create tool / CLI path that pantheon's mint helpers cannot wrap.
+    #
+    # Pass the *explicit* path and the board default separately: an explicit
+    # worktree path is accepted when its parent dir exists (git creates the
+    # worktree there), but an inherited board default must be an actual git repo
+    # — it is meant to BE the repo to branch from, so a plain non-repo dir is
+    # still un-dispatchable even though its parent exists.
+    if project_repo is None:
+        _explicit_path = None if board_default_workdir else workspace_path
+        _worktree_reason = worktree_mint_is_broken(
+            workspace_kind, _explicit_path, board_default_workdir
+        )
+        if _worktree_reason is not None:
+            raise ValueError(_worktree_reason)
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -3136,8 +3385,9 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
+                        reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3159,6 +3409,7 @@ def create_task(
                         int(max_retries) if max_retries is not None else None,
                         model_override,
                         provider_override,
+                        reasoning_effort,
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
@@ -3401,6 +3652,44 @@ def set_model_override(
         return True
 
 
+def set_reasoning_effort(
+    conn: sqlite3.Connection,
+    task_id: str,
+    effort: Optional[str],
+) -> bool:
+    """Set (or clear) the per-task reasoning effort.
+
+    ``effort=None`` (or empty) clears the override — the worker falls back to
+    its profile's own ``agent.reasoning_effort``. ``"none"`` is a real value,
+    not a clear: it pins thinking OFF for this task.
+
+    Deliberately independent of :func:`set_model_override`: a task may run the
+    profile's own model at a different depth, and clearing a model override
+    must not silently reset the depth the operator chose. Like the model
+    override, it takes effect on the NEXT dispatch, so it is settable on a
+    running task. Returns True on success.
+    """
+    effort = normalize_reasoning_effort(effort)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row["status"] == "archived":
+            raise RuntimeError(
+                f"cannot set reasoning effort on archived task {task_id}"
+            )
+        conn.execute(
+            "UPDATE tasks SET reasoning_effort = ? WHERE id = ?",
+            (effort, task_id),
+        )
+        _append_event(
+            conn, task_id, "reasoning_effort_set", {"reasoning_effort": effort}
+        )
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Links
 # ---------------------------------------------------------------------------
@@ -3541,6 +3830,33 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
     rows = conn.execute(
         "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC",
         (task_id,),
+    ).fetchall()
+    return [
+        Comment(
+            id=r["id"],
+            task_id=r["task_id"],
+            author=r["author"],
+            body=r["body"],
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+
+
+def list_comments_after(
+    conn: sqlite3.Connection, task_id: str, *, after_id: int = 0
+) -> list[Comment]:
+    """Return comments on ``task_id`` with ``id > after_id`` (ascending).
+
+    Keyed on the monotonic rowid rather than ``created_at`` so a same-second
+    burst can't be skipped. Used by the live worker bridge to fold new
+    operator notes into a running task without a restart (see
+    ``tools.kanban_tools.inject_new_comments_from_env``).
+    """
+    rows = conn.execute(
+        "SELECT id, task_id, author, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND id > ? ORDER BY id ASC",
+        (task_id, int(after_id)),
     ).fetchall()
     return [
         Comment(
@@ -3948,41 +4264,52 @@ def _synthesize_ended_run(
 # ---------------------------------------------------------------------------
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
+    """Return True when ``task_id`` must stay ``blocked`` until explicit
+    ``kanban_unblock`` / ``unblock_task``.
 
-    A ``blocked`` status can come from two very different sources:
+    A ``blocked`` status can come from three sources:
 
     * **Worker- or operator-initiated** — a worker called
       ``kanban_block(reason="review-required: ...")`` (or somebody ran
-      ``hermes kanban block <id>``).  This is a deliberate handoff that
-      should stay blocked until an operator unblocks it.  The block tool
-      emits a ``"blocked"`` event row in ``task_events``.
+      ``hermes kanban block <id>``).  Emits a ``"blocked"`` event.  This
+      is a deliberate handoff that should stay parked until an operator
+      unblocks it (#28712).
 
     * **Circuit-breaker** — ``_record_task_failure`` tripped after
-      repeated crashes / spawn failures / timeouts.  This emits
-      ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
-      automatically once the underlying conditions change (e.g. parents
-      finish, transient infra error clears).
+      repeated crashes / spawn failures / timeouts, OR a systemic
+      same-error crash batch forced ``failure_limit=1``.  Emits
+      ``"gave_up"`` (not ``"blocked"``).  The trip is durable intent:
+      ``recompute_ready`` must NOT unlock it just because the dispatcher's
+      configured ``kanban.failure_limit`` is higher than the effective
+      limit that tripped the breaker (cohort 2026-07-27: systemic
+      ``gave_up(failures=1, effective_limit=1)`` immediately followed by
+      ``promoted`` under config limit 2 → green-when-broken).
 
-    The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
+    * **Plugin hard stop** — a budget / circuit-breaker cap terminated the
+      worker (EX_NOPERM sentinel; ``detect_crashed_workers``). Emits
+      ``"hard_stop"``. Sticky for the same reason as ``gave_up``: hard stops
+      deliberately count NO failure, so without stickiness the very same
+      dispatch tick promotes the card back to ``ready`` (failures=0 clears
+      the guard) and respawns it straight into the tripped cap — an
+      unbounded burn loop the failure-limit breaker never sees.
 
-    Returns ``False`` when there is no such event at all (e.g. the task
-    was set to ``status='blocked'`` by the circuit breaker or by direct
-    DB manipulation) — preserves the pre-#28712 auto-recover semantics
-    for that path.
+    * **Legacy / direct SQL** — ``status='blocked'`` with neither event.
+      Those still auto-recover via the consecutive_failures guard so
+      pre-#28712 tooling keeps working.
+
+    Stickiness looks at the most recent ``blocked`` / ``unblocked`` /
+    ``gave_up`` event.  ``blocked`` or ``gave_up`` wins (sticky);
+    ``unblocked`` clears stickiness so a deliberate operator unblock is
+    the only exit for both worker-block and circuit-breaker trips.
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? "
+        "AND kind IN ('blocked', 'unblocked', 'gave_up', 'hard_stop') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] in ("blocked", "gave_up", "hard_stop")
 
 
 def recompute_ready(
@@ -4001,7 +4328,13 @@ def recompute_ready(
        ``kanban_block`` — those stay blocked until an explicit
        ``kanban_unblock`` (#28712).
 
-    2. The task's ``consecutive_failures`` has reached the effective
+    2. The most recent event is a circuit-breaker ``gave_up``.  Systemic
+       trips use an effective limit of 1 while the dispatcher may still
+       pass ``kanban.failure_limit`` (often 2) into this function; the
+       ``gave_up`` event is therefore the durable sticky signal, not the
+       numeric comparison alone (2026-07-27 cohort).
+
+    3. The task's ``consecutive_failures`` has reached the effective
        failure limit.  This prevents infinite retry loops when a task
        repeatedly exhausts its iteration budget: without this guard the
        counter would reset on every recovery cycle and the circuit
@@ -6693,6 +7026,24 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    interrupted: list[str] = field(default_factory=list)
+    """Task ids whose workers were killed by a graceful-termination signal
+    (SIGTERM / SIGINT — see ``_GRACEFUL_TERMINATION_SIGNALS``) and were
+    released back to ``ready`` WITHOUT counting a failure. This is the
+    infrastructure-kill carve-out: a systemd unit stop/restart (deploy,
+    ``cv-hermes-update``, operator ``systemctl restart``) SIGTERMs both the
+    in-flight workers and the embedded dispatcher, so on restart the
+    dispatcher would otherwise score every torn-down worker as ``crashed``
+    and, on the second such kill inside ``failure_limit``, permanently
+    ``gave_up`` an otherwise-healthy card. Genuine crashes (SIGKILL/OOM,
+    SIGSEGV, …) are NOT in this bucket and still count."""
+    hard_stopped: list[str] = field(default_factory=list)
+    """Task ids whose workers were terminated by a plugin policy hard stop
+    (cost cap / circuit breaker, EX_NOPERM sentinel exit). These are routed
+    straight to ``blocked`` — with a sticky ``hard_stop`` event so
+    ``recompute_ready`` cannot promote them back in the same tick — for a
+    human budget decision: no failure counted, no respawn, retrying would
+    burn the same budget against the same cap."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -6751,15 +7102,31 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"interrupted"`` — ``WIFSIGNALED`` by a *graceful-termination* signal
+      (``SIGTERM`` / ``SIGINT``, see ``_GRACEFUL_TERMINATION_SIGNALS``). This
+      is overwhelmingly an infrastructure event — a systemd unit stop/restart
+      (a deploy, ``cv-hermes-update``, an operator ``systemctl restart``), or
+      a parent shell ``Ctrl-C`` — NOT a task-logic failure. The dispatcher is
+      itself embedded in a gateway unit, so a fleet-wide restart SIGTERMs both
+      the workers and the dispatcher; when the dispatcher comes back it must
+      not count those graceful kills against the task's failure budget, or a
+      single deploy window that catches a task mid-run twice would permanently
+      ``gave_up`` it (regression: a 2026-07-20 deploy parked a productive
+      skill-revise card after two SIGTERMs inside ``failure_limit=2``).
+      ``detect_crashed_workers`` releases the task back to ``ready`` without
+      counting a failure, exactly like ``rate_limited``.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
-    * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
+    * ``"signaled"`` — ``WIFSIGNALED`` by any *other* signal (OOM killer /
+      ``SIGKILL``, ``SIGSEGV``, ``SIGABRT``, ``SIGBUS``, ``SIGFPE``, …). A
+      genuine crash: still counts toward the breaker. The OOM killer uses
+      ``SIGKILL``, so out-of-memory deaths correctly stay in this bucket.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
       something else, or died between reap tick and liveness check). Fall
       back to existing crashed-counter behavior.
 
     ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
-    ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
-    for ``unknown``.
+    ``nonzero_exit``) or the signal number (for ``signaled`` /
+    ``interrupted``), or ``None`` for ``unknown``.
     """
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
@@ -6772,9 +7139,18 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_HARD_STOP_EXIT_CODE:
+                # A plugin policy (cost cap / circuit breaker) terminated the
+                # run. Routed to ``blocked`` for a human WITHOUT counting a
+                # failure and without a respawn — retrying would just burn the
+                # same budget again.
+                return ("hard_stop", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
-            return ("signaled", os.WTERMSIG(raw))
+            sig = os.WTERMSIG(raw)
+            if sig in _GRACEFUL_TERMINATION_SIGNALS:
+                return ("interrupted", sig)
+            return ("signaled", sig)
     except Exception:
         pass
     return ("unknown", None)
@@ -7395,17 +7771,32 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     ``check_respawn_guard`` defers their respawn until the window clears.
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
+
+    When the reap registry shows the worker was terminated by a signal the
+    dispatcher itself sent (deploy or gateway restart), the task is likewise
+    released without counting a failure and reported via
+    ``_last_interrupted``.
+
+    An exit we cannot classify is NOT given that treatment. "We lost the
+    evidence" and "the task crashed" are indistinguishable in the durable
+    state this function reads, so an unclassified exit counts one ordinary
+    failure against the configured limit. It is only excluded from the
+    systemic-failure accelerator below, which is what stops a dispatcher
+    restart from turning N in-flight workers into N first-contact
+    ``gave_up`` cards.
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    interrupted: list[str] = []
+    hard_stopped: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
     # counter (see the post-txn loop below).
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[tuple[str, int, str, bool, str, bool]] = []
+    # (task_id, pid, claimer, protocol_violation, error_text, unclassified)
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
@@ -7431,6 +7822,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            interrupted_exit = False
+            hard_stop_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -7478,6 +7871,62 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+            elif kind == "interrupted":
+                # Worker was killed by a graceful-termination signal
+                # (SIGTERM / SIGINT). This is an infrastructure event — a
+                # systemd unit stop/restart (deploy, cv-hermes-update,
+                # operator ``systemctl restart``) or a parent-shell Ctrl-C —
+                # NOT a task failure. Because the dispatcher is embedded in a
+                # gateway unit, a fleet restart SIGTERMs the workers AND the
+                # dispatcher together; without this carve-out the restarted
+                # dispatcher scores every torn-down worker as ``crashed`` and
+                # a second such kill inside ``failure_limit`` permanently
+                # ``gave_up``s an otherwise-healthy card (2026-07-20 deploy
+                # incident). Release back to ``ready`` and do NOT count a
+                # failure (skip ``_record_task_failure``), exactly like the
+                # rate-limit carve-out. Genuine crashes (SIGKILL/OOM, SIGSEGV,
+                # …) are classified ``signaled`` and still count.
+                protocol_violation = False
+                interrupted_exit = True
+                error_text = (
+                    f"pid {pid} killed by signal {code} "
+                    f"(graceful termination — likely deploy/gateway restart) — "
+                    f"requeued without counting a failure"
+                )
+                event_kind = "interrupted"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "signal": code,
+                }
+            elif kind == "hard_stop":
+                # A plugin policy (cost cap / circuit breaker) terminated the
+                # run. The task is NOT broken and the worker did nothing
+                # wrong: it was denied further tool calls — including its own
+                # kanban_complete / kanban_block — so it could not reach a
+                # terminal state itself. Route the card to ``blocked`` for a
+                # human (raise the cap, split the work, accept partial output)
+                # WITHOUT counting a failure. The ``hard_stop`` event kind is
+                # STICKY for ``recompute_ready`` (see ``_has_sticky_block``):
+                # without stickiness the very same dispatch tick would promote
+                # the card back to ``ready`` (hard stops count no failure, so
+                # the consecutive_failures guard is 0) and respawn it straight
+                # into the same cap — an unbounded burn loop, strictly worse
+                # than the failure-limit breaker it bypasses.
+                protocol_violation = False
+                hard_stop_exit = True
+                error_text = (
+                    f"pid {pid} hard-stopped by a plugin policy (budget or "
+                    f"circuit-breaker cap) before it could call "
+                    f"kanban_complete/kanban_block — blocked for review, not "
+                    f"counted as a task failure and not respawned"
+                )
+                event_kind = "hard_stop"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                }
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -7493,17 +7942,31 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_code"] = code
 
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
+                (
+                    "blocked" if hard_stop_exit else "ready",
+                    row["id"], pid, row["claim_lock"],
+                ),
             )
             if cur.rowcount == 1:
-                # Rate-limited requeues are a clean release, not a crash —
-                # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # Rate-limited requeues and graceful-termination interrupts
+                # are clean releases, not crashes — record a matching run
+                # outcome so the board history doesn't show a phantom crash
+                # for a quota wall or a deploy/restart. A plugin hard stop is
+                # likewise terminal-by-policy, not a crash: its run outcome is
+                # ``hard_stop`` and the task sits in ``blocked`` for a human
+                # rather than bouncing.
+                if hard_stop_exit:
+                    _run_outcome = "hard_stop"
+                elif rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                elif interrupted_exit:
+                    _run_outcome = "interrupted"
+                else:
+                    _run_outcome = "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -7515,17 +7978,35 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload,
                     run_id=run_id,
                 )
-                if rate_limited_exit:
-                    # Stamp the failure-error column so ``check_respawn_guard``
-                    # recognizes this as a quota blocker and defers the
-                    # respawn until the window clears — WITHOUT touching
-                    # ``consecutive_failures`` (that's the whole point: no
-                    # breaker trip on a throttle).
+                if hard_stop_exit:
+                    # Stamp the block reason + kind so the board shows WHY the
+                    # card is parked and a human sees it as a budget decision,
+                    # not a mystery crash. ``capability`` is the right kind:
+                    # the worker hit a hard wall it cannot clear on its own.
+                    # No ``consecutive_failures`` touch — the task is fine.
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = ?, "
+                        "block_kind = 'capability' WHERE id = ?",
+                        (error_text[:500], row["id"]),
+                    )
+                    hard_stopped.append(row["id"])
+                elif rate_limited_exit or interrupted_exit:
+                    # No-fault release: stamp last_failure_error for board/
+                    # operator visibility, but crucially do NOT touch
+                    # ``consecutive_failures`` — a quota window (rate-limit) or
+                    # a deploy/restart window (interrupt) must never trip the
+                    # breaker. The respawn guard reads this column; the
+                    # rate-limit text triggers a cooldown, while the interrupt
+                    # text is benign (no quota/auth blocker match) so the task
+                    # is immediately re-spawnable on the next healthy tick.
                     conn.execute(
                         "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                         (error_text[:500], row["id"]),
                     )
-                    rate_limited.append(row["id"])
+                    if rate_limited_exit:
+                        rate_limited.append(row["id"])
+                    else:
+                        interrupted.append(row["id"])
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget
@@ -7542,7 +8023,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                         protocol_violation, error_text, kind == "unknown")
                     )
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the task transitions ready → blocked with a ``gave_up`` event
@@ -7564,10 +8045,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, _, err_text, _ in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for (
+            tid, pid, claimer, protocol_violation, error_text, unclassified,
+        ) in crash_details:
             if protocol_violation:
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(
@@ -7615,7 +8098,25 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     auto_blocked.append(tid)
                 continue
             fp = _error_fingerprint(error_text)
-            is_systemic = _fp_counts.get(fp, 0) >= 3
+            # Systemic accelerator: several tasks failing with the SAME error
+            # in one sweep means the cause is environmental (a bad config, a
+            # dead dependency), so retrying each to its own limit just burns
+            # budget — trip on first contact instead.
+            #
+            # UNCLASSIFIED crashes are excluded. A ``pid N not alive`` with no
+            # exit status is not evidence of a shared root cause; it is the
+            # ONE shape an infrastructure multi-kill always produces, and
+            # every such worker fingerprints identically (``_error_fingerprint``
+            # normalizes the pid away). Letting it accelerate meant a single
+            # control-plane restart with >=3 in-flight workers forced
+            # ``failure_limit=1`` and permanently ``gave_up`` every card on the
+            # first sweep, overriding the operator's configured limit — the
+            # exact 2026-07-27 incident. An unclassified exit is counted as
+            # one ordinary failure against the configured limit, but it is
+            # unavailable when the claimer pid is reused or unparseable, so
+            # the accelerator must fail open here too: these tasks still count
+            # a normal failure and still trip at the CONFIGURED limit.
+            is_systemic = not unclassified and _fp_counts.get(fp, 0) >= 3
             tripped = _record_task_failure(
                 conn, tid,
                 error=error_text,
@@ -7635,7 +8136,34 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # Same side-channel for graceful-termination interrupts (SIGTERM/SIGINT,
+    # e.g. a deploy/gateway restart) — also released without counting a
+    # failure and kept out of the ``crashed`` return.
+    detect_crashed_workers._last_interrupted = interrupted  # type: ignore[attr-defined]
+    # Same side-channel for plugin hard stops. These are already ``blocked``
+    # (terminal + sticky, awaiting a human budget decision), counted no
+    # failure, and must not appear in ``crashed`` — a respawn would just
+    # re-hit the cap.
+    detect_crashed_workers._last_hard_stopped = hard_stopped  # type: ignore[attr-defined]
     return crashed
+
+
+def _claim_lock_pid(claim_lock: Optional[str]) -> Optional[int]:
+    """Return the dispatcher pid encoded in a ``host:pid`` claim lock.
+
+    ``_claimer_id`` builds claim locks as ``f"{hostname}:{os.getpid()}"``, so
+    the trailing field identifies the *dispatcher* process that claimed the
+    task — not the worker. Returns ``None`` when the lock is missing or does
+    not carry a parseable pid (hand-written locks in tests, future formats).
+    """
+    if not claim_lock:
+        return None
+    _, _, tail = str(claim_lock).rpartition(":")
+    try:
+        pid = int(tail)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
 
 
 def _record_task_failure(
@@ -8192,6 +8720,24 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    # Graceful-termination interrupts (SIGTERM/SIGINT — deploy / gateway
+    # restart, no failure counted) — surface for telemetry / tests. These
+    # tasks went back to ``ready`` and are immediately re-spawnable once the
+    # host settles; unlike rate-limits they carry no cooldown.
+    _crash_interrupted = getattr(
+        detect_crashed_workers, "_last_interrupted", []
+    )
+    if _crash_interrupted:
+        result.interrupted.extend(_crash_interrupted)
+    # Plugin hard stops (budget / circuit-breaker cap). Already routed to
+    # ``blocked`` with a sticky ``hard_stop`` event; surfaced here so
+    # telemetry and the dispatcher log show a budget wall as its own class
+    # rather than as a crash or a silent block.
+    _crash_hard_stopped = getattr(
+        detect_crashed_workers, "_last_hard_stopped", []
+    )
+    if _crash_hard_stopped:
+        result.hard_stopped.extend(_crash_hard_stopped)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
@@ -8788,6 +9334,32 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+_retagged_workspace_roots: set[str] = set()
+
+
+def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
+    """Reclaim pre-tag worker rows in state.db so they leave the session lists.
+
+    Best-effort and gated — the durable ``state_meta`` gate lives in
+    ``retag_kanban_worker_sessions``; the in-process set keeps a busy
+    dispatcher from reopening state.db on every spawn just to read it. A
+    dispatcher tick must never fail because a session DB was busy or missing.
+    """
+    if workspaces_root_path in _retagged_workspace_roots:
+        return
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.retag_kanban_worker_sessions(workspaces_root_path)
+        finally:
+            db.close()
+        _retagged_workspace_roots.add(workspaces_root_path)
+    except Exception as exc:
+        _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -8845,6 +9417,14 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # Tag the worker's session so it lands in state.db as `kanban`, not as an
+    # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
+    # read on the board and in `hermes kanban log` — it is not a conversation
+    # the user started, so every session-browsing surface (desktop sidebar, TUI
+    # resume picker, session_search) filters it out by source. Without this the
+    # sidebar renders one row per attempt, labeled with the worker's own prompt
+    # ("work kanban task t_…").
+    env["HERMES_SESSION_SOURCE"] = "kanban"
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the
     # dispatching gateway happened to export. The worker subprocess is already
@@ -8892,6 +9472,7 @@ def _default_spawn(
     # but unusual symlink / Docker layouts are caught here too.
     env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
+    _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
     # Board slug — the final defense-in-depth pin. If the worker ever
     # resolves kanban paths without the DB / workspaces env vars, the
     # board slug still forces it to the right directory.
@@ -8938,6 +9519,11 @@ def _default_spawn(
         # the classic mis-set that stalls a board).
         if task.provider_override:
             cmd.extend(["--provider", task.provider_override])
+    # Per-task thinking depth. Independent of the model override — a task can
+    # run the profile's own model at a different depth — so this is its own
+    # branch, not a nested one.
+    if task.reasoning_effort:
+        cmd.extend(["--reasoning", task.reasoning_effort])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
@@ -9510,15 +10096,65 @@ def add_notify_sub(
             )
 
 
+def _notify_profile_filter(
+    notifier_profiles: Optional[Iterable[str]],
+    *,
+    include_unowned: bool,
+) -> tuple[str, list[str]]:
+    """Build an optional SQL predicate for notification profile ownership."""
+    if notifier_profiles is None:
+        return "", []
+
+    profiles = sorted(
+        {
+            str(profile).strip()
+            for profile in notifier_profiles
+            if str(profile).strip()
+        }
+    )
+    clauses: list[str] = []
+    params: list[str] = []
+    if profiles:
+        clauses.append(
+            "notifier_profile IN (" + ",".join("?" for _ in profiles) + ")"
+        )
+        params.extend(profiles)
+    if include_unowned:
+        clauses.append("notifier_profile IS NULL OR notifier_profile = ''")
+    if not clauses:
+        return "0", []
+    return "(" + ") OR (".join(clauses) + ")", params
+
+
 def list_notify_subs(
-    conn: sqlite3.Connection, task_id: Optional[str] = None,
+    conn: sqlite3.Connection,
+    task_id: Optional[str] = None,
+    *,
+    notifier_profiles: Optional[Iterable[str]] = None,
+    include_unowned: bool = False,
 ) -> list[dict]:
+    """List subscriptions, optionally restricted to notifier profile owners.
+
+    Passing no ``notifier_profiles`` preserves the historical all-subscriptions
+    result. Gateway notifier processes pass the profiles whose adapters they
+    own so they cannot claim another gateway's events. ``include_unowned`` is
+    used by the dispatch owner for legacy rows created before profile stamping.
+    """
+    owner_where, owner_params = _notify_profile_filter(
+        notifier_profiles, include_unowned=include_unowned,
+    )
+    where: list[str] = []
+    params: list[Any] = []
     if task_id is not None:
-        rows = conn.execute(
-            "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (task_id,),
-        ).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM kanban_notify_subs").fetchall()
+        where.append("task_id = ?")
+        params.append(task_id)
+    if owner_where:
+        where.append(owner_where)
+        params.extend(owner_params)
+    sql = "SELECT * FROM kanban_notify_subs"
+    if where:
+        sql += " WHERE " + " AND ".join(f"({clause})" for clause in where)
+    rows = conn.execute(sql, params).fetchall()
     out: list[dict] = []
     for row in rows:
         item = dict(row)
@@ -9534,6 +10170,11 @@ def count_notify_subs(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
+    notifier_profiles: Optional[Iterable[str]] = None,
+    include_unowned: bool = False,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
 ) -> int:
     """Count ``kanban_notify_subs`` rows via a read-only connection.
 
@@ -9545,8 +10186,13 @@ def count_notify_subs(
     write table content). Rows in a not-yet-checkpointed WAL are
     visible, so a freshly added subscription is never missed. A missing
     DB, or a legacy DB that predates the subscriptions table, counts as
-    zero. Path resolution matches :func:`connect` (explicit ``db_path``,
-    else ``board`` via :func:`kanban_db_path`). Raises
+    zero. When ``notifier_profiles`` is supplied, only subscriptions owned
+    by those profiles are counted; ``include_unowned`` also includes legacy
+    rows without an owner stamp. Optional platform/chat/thread filters narrow
+    the probe to one notification owner without changing the unfiltered count.
+    Platform matching is case-insensitive, matching notifier routing; chat and
+    thread identifiers are exact. Path resolution matches :func:`connect`
+    (explicit ``db_path``, else ``board`` via :func:`kanban_db_path`). Raises
     :class:`sqlite3.Error` when the DB exists but cannot be read
     (locked, corrupt); callers choose their own fallback.
     """
@@ -9556,9 +10202,27 @@ def count_notify_subs(
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     try:
         try:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM kanban_notify_subs"
-            ).fetchone()
+            owner_where, owner_params = _notify_profile_filter(
+                notifier_profiles, include_unowned=include_unowned,
+            )
+            clauses: list[str] = []
+            params: list[Any] = []
+            if owner_where:
+                clauses.append(f"({owner_where})")
+                params.extend(owner_params)
+            if platform is not None:
+                clauses.append("LOWER(platform) = LOWER(?)")
+                params.append(platform)
+            if chat_id is not None:
+                clauses.append("chat_id = ?")
+                params.append(chat_id)
+            if thread_id is not None:
+                clauses.append("thread_id = ?")
+                params.append(thread_id)
+            query = "SELECT COUNT(*) FROM kanban_notify_subs"
+            if clauses:
+                query += " WHERE " + " AND ".join(clauses)
+            row = conn.execute(query, params).fetchone()
         except sqlite3.OperationalError as exc:
             if "no such table" in str(exc).lower():
                 return 0

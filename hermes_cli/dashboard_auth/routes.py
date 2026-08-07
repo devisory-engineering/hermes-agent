@@ -809,20 +809,33 @@ async def api_auth_ws_ticket(request: Request):
     multiple times in quick succession (e.g. one ticket per WS) is the
     expected pattern.
     """
-    sess = getattr(request.state, "session", None)
-    if sess is None:
-        # Middleware should already have rejected, but check defensively.
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
     # Import here so the routes module stays usable in test contexts that
     # don't load the ticket store.
     from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
 
-    ticket = mint_ticket(user_id=sess.user_id, provider=sess.provider)
+    sess = getattr(request.state, "session", None)
+    if sess is not None:
+        ws_user_id = sess.user_id
+        ws_provider = sess.provider
+    else:
+        # A headless desktop-remote client authenticates with the session-token
+        # provider (gated_auth_middleware sets token_principal/token_authenticated,
+        # never a cookie session). Mint the WS ticket from that principal so the
+        # Desktop app can open /api/pty, /api/ws, /api/events — otherwise the
+        # interactive terminal, the whole point of remote pairing, is unreachable.
+        principal = getattr(request.state, "token_principal", None)
+        if getattr(request.state, "token_authenticated", False) and principal is not None:
+            ws_user_id = principal.principal
+            ws_provider = principal.provider
+        else:
+            # Middleware should already have rejected, but check defensively.
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    ticket = mint_ticket(user_id=ws_user_id, provider=ws_provider)
     audit_log(
         AuditEvent.WS_TICKET_MINTED,
-        provider=sess.provider,
-        user_id=sess.user_id,
+        provider=ws_provider,
+        user_id=ws_user_id,
         ip=_client_ip(request),
     )
     return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}

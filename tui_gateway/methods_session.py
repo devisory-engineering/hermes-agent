@@ -170,10 +170,11 @@ def _(rid, params: dict) -> dict:
             # ones not enumerated here), ACP adapter clients, webhook sessions,
             # custom `HERMES_SESSION_SOURCE` values, and older installs with
             # different source labels. We deny-list only the noisy internal
-            # sources (``tool`` sub-agent runs) rather than allow-listing a
-            # fixed set of platform names that goes stale whenever a new
-            # platform is added or a user names their own source.
-            deny = frozenset({"tool"})
+            # sources (``tool`` sub-agent runs and ``kanban`` dispatcher
+            # workers) rather than allow-listing a fixed set of platform names
+            # that goes stale whenever a new platform is added or a user names
+            # their own source.
+            deny = frozenset({"kanban", "tool"})
 
             limit = int(params.get("limit", 200) or 200)
             # Over-fetch modestly so per-source filtering doesn't leave us
@@ -215,7 +216,7 @@ def _(rid, params: dict) -> dict:
     """Return the most recent human-facing session id, or ``None``.
 
     Mirrors ``session.list``'s deny-list behaviour (drops ``tool``
-    sub-agent rows).  Used by TUI auto-resume when
+    sub-agent rows and ``kanban`` worker rows).  Used by TUI auto-resume when
     ``display.tui_auto_resume_recent`` is on; the field is also handy
     for any CLI tooling that wants "latest session" without paginating
     the full list.
@@ -232,7 +233,7 @@ def _(rid, params: dict) -> dict:
         if db is None:
             return _ok(rid, {"session_id": None})
         try:
-            deny = frozenset({"tool"})
+            deny = frozenset({"kanban", "tool"})
             # Over-fetch by a generous bounded amount so heavy sub-agent
             # users (lots of recent ``tool`` rows) don't get a false
             # "no eligible session" answer.  ``session.list`` uses a
@@ -304,6 +305,35 @@ def _(rid, params: dict) -> dict:
 
 @method("session.resume")
 def _(rid, params: dict) -> dict:
+    """Ownership wrapper around the resume handler.
+
+    ``session.resume`` mints a profile-scoped ``SessionDB`` for a non-launch
+    profile before it knows which of its several exits it will take. Only the
+    eager path hands that handle to a live session (which then owns it); the
+    lazy/watch and deferred-build paths return without ever giving it an owner,
+    and the deferred build re-mints its own handle anyway. Left unowned the
+    connection is never closed, so every sidebar chat-switch in the desktop app
+    permanently adds a ``state.db`` (+ ``-wal``/``-shm``) descriptor to the
+    backend process.
+
+    Close the handle on the way out unless the inner handler adopted it onto a
+    live session.
+    """
+    box: dict = {}
+    try:
+        return _session_resume(rid, params, box)
+    finally:
+        if not box.get("adopted"):
+            db = box.pop("db", None)
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    logger.debug("failed to close resume profile db", exc_info=True)
+
+
+@_registry.helper
+def _session_resume(rid, params: dict, _db_box: dict) -> dict:
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
@@ -315,13 +345,19 @@ def _(rid, params: dict) -> dict:
     # local profile's state.db. None/own profile → the launch profile (unchanged).
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
+    # Desktop hydrates persisted transcripts through the authenticated REST
+    # route in parallel. Suppress the duplicate WebSocket transcript only when
+    # the caller explicitly requests it; other clients keep upstream behavior.
+    omit_messages = is_truthy_value(params.get("omit_messages", False))
 
-    # In a profile scope, the agent OWNS a long-lived db handle bound to that
-    # profile (do NOT auto-close it here). Otherwise reuse the shared launch db.
+    # In a profile scope this handle is minted here and is NOT owned by anyone
+    # yet — record it in ``_db_box`` so the wrapper closes it on every exit
+    # that does not hand it to a live session (which sets ``adopted``).
     if profile_home is not None:
         from hermes_state import SessionDB
 
         db = SessionDB(db_path=profile_home / "state.db")
+        _db_box["db"] = db
     else:
         db = _get_db()
     if db is None:
@@ -379,6 +415,7 @@ def _(rid, params: dict) -> dict:
             cols=cols,
             touch=True,
             transport=current_transport() or _stdio_transport,
+            omit_messages=omit_messages,
         )
         payload["resumed"] = target
         # A lazy watch session never owns a run loop, so its payload's running
@@ -449,14 +486,15 @@ def _(rid, params: dict) -> dict:
         except Exception:
             logger.debug("child-watch display projection read failed", exc_info=True)
             display_history = history
-        messages = _history_to_messages(display_history)
+        messages = [] if omit_messages else _history_to_messages(display_history)
         return _ok(
             rid,
             {
                 "session_id": sid,
                 "resumed": target,
-                "message_count": len(messages),
+                "message_count": len(display_history) if omit_messages else len(messages),
                 "messages": messages,
+                "messages_omitted": omit_messages,
                 "info": _lazy_resume_info(cwd, profile=profile),
                 "inflight": None,
                 "running": child_running,
@@ -493,7 +531,13 @@ def _(rid, params: dict) -> dict:
             # (raw_history → sanitize_replay_history → the resumed session's
             # working conversation) and the display copy stays verbatim —
             # inspection/export must show what is actually stored.
-            raw_history, display_history = db.get_resume_conversations(target)
+            if omit_messages:
+                raw_history = db.get_messages_as_conversation(
+                    target, repair_alternation=True
+                )
+                display_history = []
+            else:
+                raw_history, display_history = db.get_resume_conversations(target)
         except Exception as e:
             if lease is not None:
                 lease.release()
@@ -501,7 +545,7 @@ def _(rid, params: dict) -> dict:
         # Display keeps the full transcript; the model-fed history drops a
         # dangling/interrupted tool-call tail so a session killed mid-loop does
         # not replay the unanswered call forever (#29086).
-        prefix = db.get_ancestor_display_prefix(target)
+        prefix = [] if omit_messages else db.get_ancestor_display_prefix(target)
         history = sanitize_replay_history(raw_history)
         # Restore the model/provider/reasoning/tier this chat last used so the
         # deferred build (and the info below) match the eager path — without them
@@ -529,12 +573,13 @@ def _(rid, params: dict) -> dict:
         _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
         auto_continue = _maybe_schedule_auto_continue(sid, record, target)
 
-        messages = _history_to_messages(display_history)
+        messages = [] if omit_messages else _history_to_messages(display_history)
         payload = {
             "session_id": sid,
             "resumed": target,
-            "message_count": len(messages),
+            "message_count": len(raw_history) if omit_messages else len(messages),
             "messages": messages,
+            "messages_omitted": omit_messages,
             "info": _lazy_resume_info(
                 cwd,
                 model=model_override.get("model") or "",
@@ -572,7 +617,13 @@ def _(rid, params: dict) -> dict:
         # One lineage SELECT feeds both projections (see the interactive resume
         # above): the model-fed copy is alternation-repaired for LIVE REPLAY, the
         # display copy stays verbatim.
-        raw_history, display_history = db.get_resume_conversations(target)
+        if omit_messages:
+            raw_history = db.get_messages_as_conversation(
+                target, repair_alternation=True
+            )
+            display_history = []
+        else:
+            raw_history, display_history = db.get_resume_conversations(target)
         # The display transcript keeps every row so the user still sees their
         # full history.  The model-fed history is sanitized: a session whose
         # last turn died mid-tool-loop persists a dangling assistant(tool_calls)
@@ -580,9 +631,11 @@ def _(rid, params: dict) -> dict:
         # re-issue the unanswered call forever — the permanent-"thinking" stuck
         # session in #29086.  The messaging gateway already strips this; this is
         # the WebUI/TUI resume path picking up the same cleanup.
-        display_history_prefix = db.get_ancestor_display_prefix(target)
+        display_history_prefix = (
+            [] if omit_messages else db.get_ancestor_display_prefix(target)
+        )
         history = sanitize_replay_history(raw_history)
-        messages = _history_to_messages(display_history)
+        messages = [] if omit_messages else _history_to_messages(display_history)
         tokens = _set_session_context(target)
         try:
             # Pass the profile's db so the agent persists turns to the right
@@ -631,6 +684,7 @@ def _(rid, params: dict) -> dict:
                 cols=cols,
                 touch=True,
                 transport=current_transport() or _stdio_transport,
+                omit_messages=omit_messages,
             )
             payload["resumed"] = target
             return _ok(rid, payload)
@@ -656,6 +710,12 @@ def _(rid, params: dict) -> dict:
                     session_db=db,
                     source=source,
                 )
+                # The live session now owns the profile handle: teardown closes
+                # it, and the wrapper must not close it out from under a
+                # running session.
+                if profile_home is not None:
+                    _adopt_owned_session_db(_sessions.get(sid), db)
+                    _db_box["adopted"] = True
             finally:
                 if init_home_token is not None:
                     reset_hermes_home_override(init_home_token)
@@ -684,8 +744,9 @@ def _(rid, params: dict) -> dict:
     payload = {
         "session_id": sid,
         "resumed": target,
-        "message_count": len(messages),
+        "message_count": len(raw_history) if omit_messages else len(messages),
         "messages": messages,
+        "messages_omitted": omit_messages,
         "info": _session_info(agent, session),
         "inflight": None,
         "running": False,
@@ -781,6 +842,7 @@ def _(rid, params: dict) -> dict:
             session,
             touch=True,
             transport=current_transport() or _stdio_transport,
+            omit_messages=is_truthy_value(params.get("omit_messages", False)),
         ),
     )
 
@@ -2624,20 +2686,29 @@ def _(rid, params: dict) -> dict:
                     else None
                 ),
             )
-            for msg in history:
-                db.append_message(
-                    session_id=new_key,
-                    role=msg.get("role", "user"),
-                    content=msg.get("content"),
-                    # Preserve the parent's original message timestamps —
-                    # branch copies are history, not new activity (9d73006ad).
-                    timestamp=msg.get("timestamp"),
-                )
+            # Copy the whole parent history in bounded-chunk transactions —
+            # a branch seed can be hundreds of rows, and per-row transactions
+            # were the write-amplification pattern removed in #23254.
+            db.append_messages_batch(
+                new_key,
+                [
+                    {
+                        "role": msg.get("role", "user"),
+                        "content": msg.get("content"),
+                        # Preserve the parent's original message timestamps —
+                        # branch copies are history, not new activity (9d73006ad).
+                        "timestamp": msg.get("timestamp"),
+                    }
+                    for msg in history
+                ],
+                chunk_rows=500,
+            )
             db.set_session_title(new_key, title)
         except Exception as e:
             if lease is not None:
                 lease.release()
             return _err(rid, 5008, f"branch failed: {e}")
+    branch_db = None
     try:
         # Bind the branched AGENT to the parent's profile, mirroring
         # session.create/resume: home override so config/skills/memory resolve
@@ -2647,13 +2718,22 @@ def _(rid, params: dict) -> dict:
         # parent's db while the agent stayed on the launch handle would
         # recreate the cross-profile split one turn later.
         parent_home = session.get("profile_home")
-        branch_db = None
         if parent_home:
             from hermes_state import SessionDB
 
             branch_db = SessionDB(db_path=Path(parent_home) / "state.db")
         home_token = (
             set_hermes_home_override(parent_home) if parent_home else None
+        )
+        # The home override alone only moves config/skills/memory; credentials
+        # resolve through get_secret(), which without a scope falls through to
+        # process os.environ — the LAUNCH profile's .env. Install the parent's
+        # secret scope for the build, exactly as session.create/resume do
+        # (#67605), so the branched agent authenticates as its own profile.
+        secret_token = (
+            set_secret_scope(build_profile_secret_scope(Path(parent_home)))
+            if parent_home
+            else None
         )
         try:
             tokens = _set_session_context(new_key)
@@ -2678,7 +2758,13 @@ def _(rid, params: dict) -> dict:
                 source=source,
                 profile_home=parent_home,
             )
+            # The branch session owns the handle minted above; without this the
+            # connection outlives the branch and leaks a state.db descriptor.
+            if branch_db is not None:
+                _adopt_owned_session_db(_sessions.get(new_sid), branch_db)
         finally:
+            if secret_token is not None:
+                reset_secret_scope(secret_token)
             if home_token is not None:
                 reset_hermes_home_override(home_token)
         if new_sid in _sessions:
@@ -2686,6 +2772,13 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         if lease is not None:
             lease.release()
+        # The branch handle never reached a live session on this path, so
+        # nothing else will ever close it.
+        if branch_db is not None and _sessions.get(new_sid) is None:
+            try:
+                branch_db.close()
+            except Exception:
+                logger.debug("failed to close orphaned branch db", exc_info=True)
         return _err(rid, 5000, f"agent init failed on branch: {e}")
     branched_session = _sessions.get(new_sid)
     return _ok(
@@ -2720,6 +2813,8 @@ def _(rid, params: dict) -> dict:
         with session["history_lock"]:
             session["_turn_cancel_requested"] = True
             session["queued_prompt"] = None
+            session.pop("queued_prompts", None)
+            session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
         _clear_pending(sid)
         try:
             from tools.approval import resolve_gateway_approval
@@ -2741,11 +2836,15 @@ def _(rid, params: dict) -> dict:
     run_thread = session.get("_run_thread")
     run_thread_alive = run_thread is not None and run_thread.is_alive()
     should_interrupt = bool(session.get("running"))
-    if should_interrupt and hasattr(session["agent"], "interrupt"):
-        session["agent"].interrupt()
     with session["history_lock"]:
         session["_turn_cancel_requested"] = True
         session["queued_prompt"] = None
+        session.pop("queued_prompts", None)
+        session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
+    if should_interrupt:
+        from agent.interrupt_compat import request_hard_interrupt
+
+        request_hard_interrupt(session["agent"])
     if not run_thread_alive:
         with session["history_lock"]:
             if session.get("running"):

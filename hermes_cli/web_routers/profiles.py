@@ -20,7 +20,7 @@ import time  # noqa: F401
 from pathlib import Path  # noqa: F401
 from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
 
-from fastapi import APIRouter, HTTPException  # noqa: F401
+from fastapi import APIRouter, HTTPException, Query  # noqa: F401
 
 from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
@@ -41,9 +41,12 @@ router = APIRouter()
 
 # Late-bound web_server helpers (resolved at call time; cycle-safe,
 # monkeypatch-transparent).
+_assert_model_control_allowed = late("_assert_model_control_allowed")
 _cron_profile_home = late("_cron_profile_home")
 _disable_unselected_skills = late("_disable_unselected_skills")
 _fallback_profile_dicts = late("_fallback_profile_dicts")
+_filter_isolated_profile_records = late("_filter_isolated_profile_records")
+_isolated_profile = late("_isolated_profile")
 _hub_action_name = late("_hub_action_name")
 _profile_setup_command = late("_profile_setup_command")
 _profile_to_dict = late("_profile_to_dict")
@@ -56,8 +59,14 @@ _write_profile_model = late("_write_profile_model")
 
 @sessions_router.get("/api/profiles/sessions")
 def get_profiles_sessions(
-    limit: int = 20,
-    offset: int = 0,
+    # ``le=500`` caps the per-request page size (idea from #39200) — this
+    # endpoint fans the query out across EVERY profile's state.db, so an
+    # unbounded limit multiplies the damage. 500 (not 100) because real
+    # desktop callers use limit=200 (sessions-settings ARCHIVED_FETCH_LIMIT,
+    # command palette) and the electron remote-merge over-fetches
+    # ``limit + offset``.
+    limit: int = Query(20, ge=0, le=500),
+    offset: int = Query(0, ge=0),
     min_messages: int = 0,
     archived: str = "exclude",
     order: str = "recent",
@@ -100,6 +109,14 @@ def get_profiles_sessions(
             targets = []
         if not targets:
             targets.append(("default", profiles_mod.get_profile_dir("default")))
+        # In --isolated mode, never aggregate sibling profiles' sessions: keep
+        # only this instance's own profile (or resolve it directly if the scan
+        # above didn't surface it).
+        _iso = _isolated_profile()
+        if _iso:
+            targets = [(n, h) for (n, h) in targets if n == _iso] or [
+                (_iso, profiles_mod.get_profile_dir(_iso))
+            ]
 
     min_message_count = max(0, min_messages)
     archived_only = archived == "only"
@@ -231,6 +248,14 @@ def get_profiles_sessions_sidebar(
         targets = []
     if not targets:
         targets.append(("default", profiles_mod.get_profile_dir("default")))
+    # In --isolated mode, never aggregate sibling profiles' sessions: keep
+    # only this instance's own profile (same trim as /api/profiles/sessions —
+    # this batched sibling predates the gate and had the same fan-out).
+    _iso = _isolated_profile()
+    if _iso:
+        targets = [(n, h) for (n, h) in targets if n == _iso] or [
+            (_iso, profiles_mod.get_profile_dir(_iso))
+        ]
 
     recents_scope = (recents_profile or "all").strip() or "all"
     recents_exclude_list = [s for s in (recents_exclude or "").split(",") if s.strip()]
@@ -338,15 +363,22 @@ async def list_profiles_endpoint():
     try:
         loop = asyncio.get_running_loop()
         profiles = await loop.run_in_executor(None, profiles_mod.list_profiles)
-        return {"profiles": [_profile_to_dict(p) for p in profiles]}
+        return {"profiles": _filter_isolated_profile_records(
+            [_profile_to_dict(p) for p in profiles])}
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")
-        return {"profiles": _fallback_profile_dicts(profiles_mod)}
+        return {"profiles": _filter_isolated_profile_records(
+            _fallback_profile_dicts(profiles_mod))}
 
 
 @router.post("/api/profiles")
 async def create_profile_endpoint(body: ProfileCreate):
     from hermes_cli import profiles as profiles_mod
+    # 0017: the create body accepts provider/model — a model-selection write
+    # outside every /api/model/* gate. Refuse it (only when actually set, so a
+    # plain create still works) on an isolated dashboard.
+    if (body.provider or "").strip() or (body.model or "").strip():
+        _assert_model_control_allowed()
     explicit_source = (body.clone_from or "").strip()
     if explicit_source:
         # Duplicating a specific profile: clone its config/skills/SOUL (or full
@@ -467,6 +499,17 @@ async def get_active_profile_endpoint():
     the running dashboard/gateway is scoped to (derived from HERMES_HOME).
     """
     from hermes_cli import profiles as profiles_mod
+    iso = _isolated_profile()
+    if iso:
+        # An --isolated dashboard is locked to exactly one profile. The sticky
+        # active_profile marker is machine-global (it lives under the shared
+        # HERMES_HOME), so it reads whatever the machine default is — typically
+        # "default". Reporting that as ``active`` misleads the frontend into
+        # managing "default": it shows an empty skill list and sends
+        # ``?profile=default`` on every call, which this isolated server then
+        # 403s ("scoped to a single profile"). Report the locked profile for
+        # both fields so the UI manages the one profile this server serves.
+        return {"active": iso, "current": iso}
     try:
         active = profiles_mod.get_active_profile() or "default"
     except Exception:
@@ -642,6 +685,7 @@ async def update_profile_model_endpoint(name: str, body: ProfileModelUpdate):
     active profile. Mirrors ``POST /api/model/set`` (main scope) but scoped
     to the named profile via the HERMES_HOME override.
     """
+    _assert_model_control_allowed()
     profile_dir = _resolve_profile_dir(name)
     provider = (body.provider or "").strip()
     model = (body.model or "").strip()

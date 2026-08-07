@@ -1,8 +1,8 @@
 ---
 name: notion
 description: "Notion API + ntn CLI: pages, databases, markdown, Workers."
-version: 2.0.0
-author: community
+version: 2.0.0-cv
+author: cloudvisor (overlay on community v2.0.0)
 license: MIT
 platforms: [linux, macos, windows]
 prerequisites:
@@ -23,6 +23,44 @@ Talk to Notion two ways. Same integration token works for both — pick by what'
 ## Setup
 
 ### 1. Get an integration token (required for both paths)
+
+#### Cloudvisor pantheon runtime (Olympus, sandbox agents)
+
+The token lives in AWS Secrets Manager under
+`/cloudvisor/agents/shared/credentials`. Fetch with `cv-secret`:
+
+```bash
+export NOTION_API_TOKEN=$(cv-secret NOTION_API_TOKEN)  # ntn reads NOTION_API_TOKEN
+export NOTION_KEYRING=0                                 # skip OS keychain in containers
+```
+
+The image-wide `ENV NOTION_KEYRING=0` is baked into `spartans-sandbox`, so
+`ntn` falls back cleanly to the env-var token without an interactive
+`ntn login`. The sandbox does NOT forward `NOTION_API_KEY` from
+`~/.hermes/.env` — `cv-secret` is the canonical path on Olympus.
+
+Token-name disambiguation (all three resolve to the same value via
+`cv-secret` aliases):
+
+- `NOTION_API_TOKEN` — what the **`ntn` CLI** expects
+- `NOTION_TOKEN` — canonical key in our Secrets Manager blob; what curl
+  examples use
+- `NOTION_API_KEY` — the **upstream community-skill** name; same value
+
+Don't:
+- read `~/.hermes/.env` directly (the sandbox doesn't forward those values)
+- use Doppler (we don't run it on Olympus)
+- search for tokens in other locations
+
+If `cv-secret NOTION_API_TOKEN` returns `key not found`, ask Julio in
+`#eng-pantheon-mgmt`. Don't hunt for it elsewhere.
+
+**Share target pages/databases with the integration** in Notion: page
+menu `...` → `Connect to` → your integration name. Without this, the
+API returns 404 for that page even though it exists — easy to misdiagnose
+as "page doesn't exist."
+
+#### Other Hermes installs (default — non-Cloudvisor)
 
 1. Create an integration at https://notion.so/my-integrations
 2. Copy the API key (starts with `ntn_` or `secret_`)

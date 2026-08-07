@@ -45,11 +45,20 @@ from typing import Awaitable, Callable, Optional, Tuple
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response
 
-from hermes_cli.dashboard_auth import list_token_providers
+from hermes_cli.dashboard_auth import (
+    list_session_token_providers,
+    list_token_providers,
+)
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.base import ProviderError, TokenPrincipal
 
 _log = logging.getLogger(__name__)
+
+# The Desktop app / headless clients present their per-backend credential in a
+# dedicated header (it avoids colliding with a reverse proxy that already uses
+# ``Authorization``). ``gated_auth_middleware`` verifies it against the
+# ``supports_session_token`` providers as a cookie-session stand-in.
+SESSION_TOKEN_HEADER = "X-Hermes-Session-Token"
 
 # Exact paths that accept non-interactive bearer-token auth. A route registers
 # itself here at import/startup; the seam only acts on registered paths.
@@ -134,6 +143,62 @@ def authenticate_token(
             _log.warning(
                 "dashboard-auth: token provider %r raised during verify: %s",
                 provider.name, e,
+            )
+            continue
+        if principal is not None:
+            return principal, None
+    return None, unreachable
+
+
+def extract_session_or_bearer_token(request: Request) -> str:
+    """Return the client's credential token from the header pair, or "".
+
+    Prefers the dedicated ``X-Hermes-Session-Token`` header (what the Hermes
+    Desktop app sends), falling back to ``Authorization: Bearer <token>`` for
+    older shells. Empty string ⇒ "no token presented".
+    """
+    hdr = request.headers.get(SESSION_TOKEN_HEADER, "").strip()
+    if hdr:
+        return hdr
+    return extract_bearer_token(request)
+
+
+def authenticate_session_token(
+    request: Request,
+) -> Tuple[Optional[TokenPrincipal], Optional[str]]:
+    """Verify a header-carried token against the session-token providers.
+
+    The cookie-session stand-in used by ``gated_auth_middleware`` for headless
+    clients (Hermes Desktop remote pairing). Mirrors :func:`authenticate_token`
+    but (a) reads the token from ``X-Hermes-Session-Token`` (or Bearer), and
+    (b) consults ONLY ``list_session_token_providers()`` — never the broader
+    per-route ``supports_token`` set — so a service credential (drain) can never
+    authenticate the full interactive surface.
+
+    Returns ``(principal, unreachable_provider_name)`` exactly like
+    :func:`authenticate_token`. Fails closed: no token, or no provider
+    recognises it ⇒ ``(None, None)`` and the caller falls back to cookie auth.
+    Never raises.
+    """
+    token = extract_session_or_bearer_token(request)
+    if not token:
+        return None, None
+    unreachable: Optional[str] = None
+    for provider in list_session_token_providers():
+        try:
+            principal = provider.verify_token(token=token)
+        except ProviderError as e:
+            _log.warning(
+                "dashboard-auth: session-token provider %r unreachable during "
+                "verify: %s", provider.name, e,
+            )
+            if unreachable is None:
+                unreachable = provider.name
+            continue
+        except Exception as e:  # noqa: BLE001 — a buggy provider must not 500 the gate
+            _log.warning(
+                "dashboard-auth: session-token provider %r raised during "
+                "verify: %s", provider.name, e,
             )
             continue
         if principal is not None:

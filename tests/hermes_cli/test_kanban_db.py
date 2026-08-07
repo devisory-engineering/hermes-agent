@@ -165,6 +165,131 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Worktree mint hygiene — reject un-dispatchable worktree cards at mint time.
+# A ``workspace_kind=worktree`` card needs a git repo to branch from. If the
+# caller supplies no resolvable ``workspace_path`` AND the board carries no
+# git-repo ``default_workdir``, the card can never dispatch: it would
+# ``spawn_failed`` until the breaker trips and parks it silently blocked. Refuse
+# to write the row instead (regression: fleet-heal bad-worktree-mint incident,
+# residual after the pantheon card_mint_guard which only covered pantheon's own
+# mint helpers, not the raw ``kanban_create`` tool / CLI path).
+# ---------------------------------------------------------------------------
+
+def test_worktree_mint_rejects_empty_path_on_null_default_board(kanban_home):
+    with kb.connect() as conn, pytest.raises(ValueError, match="worktree"):
+        kb.create_task(
+            conn,
+            title="broken worktree",
+            assignee="hephaestus",
+            workspace_kind="worktree",
+        )
+
+
+def test_worktree_mint_rejects_relative_path(kanban_home):
+    with kb.connect() as conn, pytest.raises(ValueError, match="worktree"):
+        kb.create_task(
+            conn,
+            title="relative worktree",
+            workspace_kind="worktree",
+            workspace_path="relative/wt/path",
+        )
+
+
+def test_worktree_mint_rejects_nonexistent_parent_path(kanban_home):
+    # Absolute path whose PARENT does not exist and which is not itself a repo:
+    # git cannot create a worktree there, so the card is un-dispatchable.
+    with kb.connect() as conn, pytest.raises(ValueError, match="worktree"):
+        kb.create_task(
+            conn,
+            title="dangling worktree",
+            workspace_kind="worktree",
+            workspace_path="/nonexistent-abcxyz/deeper/still/wt",
+        )
+
+
+def test_worktree_mint_accepts_absolute_path_with_existing_parent(kanban_home, tmp_path):
+    # Explicit target under a real git repo whose .worktrees dir does not exist
+    # yet — dispatch walks up to the repo root, so mint must accept it.
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / ".worktrees" / "t-ok"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="ok worktree",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path == str(target)
+
+
+def test_worktree_mint_accepts_path_that_is_a_git_repo(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="repo worktree",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.workspace_path == str(repo)
+
+
+def test_worktree_mint_accepts_when_board_default_workdir_is_git_repo(kanban_home, tmp_path):
+    # No explicit workspace_path, but the board's default_workdir is a real git
+    # repo the dispatcher will fall back to — this is dispatchable, so accept.
+    repo = tmp_path / "board-repo"
+    _init_git_repo(repo)
+    kb.write_board_metadata("default", default_workdir=str(repo))
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="board-default worktree",
+            workspace_kind="worktree",
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    # create_task inherits the board default_workdir into workspace_path.
+    assert task.workspace_path == str(repo)
+
+
+def test_worktree_mint_rejects_when_board_default_workdir_not_a_repo(kanban_home, tmp_path):
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    kb.write_board_metadata("default", default_workdir=str(plain))
+    # The board default is inherited into workspace_path, but it is not a git
+    # repo and its own parent (tmp_path) exists — so the containment/parent rule
+    # would otherwise accept it. It must still be rejected because a worktree
+    # needs an actual git repo to branch from.
+    with kb.connect() as conn, pytest.raises(ValueError, match="git repo"):
+        kb.create_task(
+            conn,
+            title="non-repo board default worktree",
+            workspace_kind="worktree",
+        )
+
+
+def test_scratch_and_dir_mints_are_not_affected_by_worktree_guard(kanban_home, tmp_path):
+    with kb.connect() as conn:
+        # scratch with no path is always fine.
+        s = kb.create_task(conn, title="scratch ok", workspace_kind="scratch")
+        assert kb.get_task(conn, s).workspace_kind == "scratch"
+        # dir with an absolute path is governed by its own rules, not the
+        # worktree guard.
+        d = kb.create_task(
+            conn,
+            title="dir ok",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        assert kb.get_task(conn, d).workspace_kind == "dir"
+# ---------------------------------------------------------------------------
 # Links + dependency resolution
 # ---------------------------------------------------------------------------
 
@@ -254,6 +379,15 @@ def _exited_status(code: int) -> int:
     return code << 8
 
 
+def _signaled_status(sig: int, core: bool = False) -> int:
+    """Raw wait-status for a WIFSIGNALED child killed by ``sig``.
+
+    Low 7 bits carry the signal number; 0x80 is the core-dump flag. This is
+    the encoding ``os.WIFSIGNALED`` / ``os.WTERMSIG`` decode.
+    """
+    return sig | (0x80 if core else 0)
+
+
 
 
 def test_rate_limit_exit_requeues_without_counting_failure(
@@ -320,6 +454,364 @@ def test_rate_limit_exit_requeues_without_counting_failure(
 
 
 
+def test_worker_death_under_live_dispatcher_still_counts_as_crash(
+    kanban_home, monkeypatch,
+):
+    """A worker that dies under a live dispatcher is a crash and counts."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        # _claimer_id() is "<host>:<os.getpid()>" — i.e. a LIVE claimer.
+        claimer = _kb._claimer_id()
+        tid = kb.create_task(conn, title="genuine-crash", assignee="a")
+        kb.claim_task(conn, tid, claimer=claimer)
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (63002, tid),
+        )
+        conn.commit()
+
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert tid in crashed, "a crash under a live dispatcher still counts"
+        task = kb.get_task(conn, tid)
+        assert task.consecutive_failures == 1
+
+
+def test_worker_dies_first_then_claimer_dies_still_counts_as_crash(
+    kanban_home, monkeypatch,
+):
+    """A genuine crash whose dispatcher died before reaping it still counts.
+
+    This is the case that sank the earlier ``orphaned`` carve-out. The durable
+    state it read — worker pid dead with no exit status, claimer pid no longer
+    alive — is reached by two different histories:
+
+      1. the dispatcher restarted and took its worker down with it, and
+      2. the worker was SIGKILLed or OOM-killed under a live dispatcher, which
+         was then itself killed before it persisted the exit.
+
+    They are observationally identical at the next sweep, so no predicate over
+    that state can tell them apart, and a no-fault requeue would silently
+    forgive every case 2. An unclassified exit therefore counts one ordinary
+    failure against the configured limit. The systemic accelerator is still
+    excluded for unclassified exits (see the test below), which is what keeps
+    the 2026-07-27 restart incident from reappearing as first-contact
+    ``gave_up``.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        # A claimer on THIS host (detect_crashed_workers ignores other hosts)
+        # that is NOT this process and is not alive — exactly the state the
+        # withdrawn carve-out treated as proof of a restart.
+        dead_claimer = f"{_kb._claimer_id().split(':', 1)[0]}:4194304"
+        tid = kb.create_task(conn, title="crash-then-claimer-dies", assignee="a")
+        kb.claim_task(conn, tid, claimer=dead_claimer)
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (63003, tid))
+        conn.commit()
+
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert tid in crashed, (
+            "a worker that died before its dispatcher must still be a crash — "
+            "a dead claimer is not evidence the worker was innocent"
+        )
+        task = kb.get_task(conn, tid)
+        assert task.consecutive_failures == 1
+
+
+def test_unclassified_multi_kill_does_not_force_systemic_limit(
+    kanban_home, monkeypatch,
+):
+    """Four concurrent ``pid N not alive`` unknowns must NOT force
+    ``failure_limit=1``.
+
+    Defense-in-depth for the same incident: even where the orphan carve-out
+    cannot prove the claimer is gone (pid reuse, an unparseable lock), an
+    infrastructure multi-kill must not ALSO be accelerated into an immediate
+    ``gave_up``. Every such worker fingerprints identically, so the systemic
+    detector saw >=3 matches and overrode the configured ``failure_limit=2``
+    down to 1 — permanently blocking healthy cards on the first sweep.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        task_ids = []
+        for i in range(4):
+            tid = kb.create_task(conn, title=f"multi-kill-{i}", assignee="a")
+            kb.claim_task(conn, tid, claimer=f"{host}:worker-{i}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid=? WHERE id=?",
+                (64000 + i, tid),
+            )
+            task_ids.append(tid)
+        conn.commit()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert len(crashed) == 4
+
+        for tid in task_ids:
+            task = kb.get_task(conn, tid)
+            assert task.consecutive_failures == 1
+            # DEFAULT_FAILURE_LIMIT is 2, so one sweep must not block.
+            assert task.status == "ready", (
+                f"{tid}: one unclassified multi-kill must not trip the "
+                f"breaker, got {task.status}"
+            )
+            kinds = [
+                r["kind"] for r in conn.execute(
+                    "SELECT kind FROM task_events WHERE task_id=?", (tid,),
+                ).fetchall()
+            ]
+            assert "gave_up" not in kinds
+
+def test_systemic_gave_up_sticky_against_higher_recompute_limit(
+    kanban_home, monkeypatch,
+):
+    """A systemic gave_up event must not be undone by config limit 2."""
+    import json
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    _kb._recent_worker_exits.clear()
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        task_ids = []
+        now = int(time.time())
+        for i in range(3):
+            worker_pid = 870000 + i
+            tid = kb.create_task(conn, title=f"sys-sticky-{i}", assignee="a")
+            conn.execute(
+                "UPDATE tasks SET status='running', worker_pid=?, "
+                "claim_lock=?, consecutive_failures=0, started_at=? WHERE id=?",
+                (worker_pid, f"{host}:wsticky{i}", now - 120, tid),
+            )
+            _kb._record_worker_exit(worker_pid, _signaled_status(9))
+            task_ids.append(tid)
+        conn.commit()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert set(crashed) == set(task_ids)
+
+        for tid in task_ids:
+            task = kb.get_task(conn, tid)
+            assert task.status == "blocked", tid
+            assert task.consecutive_failures == 1, tid
+            row = conn.execute(
+                "SELECT kind, payload FROM task_events "
+                "WHERE task_id=? AND kind='gave_up' ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            assert row is not None, tid
+            payload = json.loads(row["payload"])
+            assert payload["failures"] == 1
+            assert payload["effective_limit"] == 1
+
+        promoted = kb.recompute_ready(conn, failure_limit=2)
+        assert promoted == 0
+        for tid in task_ids:
+            assert kb.get_task(conn, tid).status == "blocked"
+            assert kb.get_task(conn, tid).consecutive_failures == 1
+
+        assert kb.unblock_task(conn, task_ids[0])
+        task = kb.get_task(conn, task_ids[0])
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+
+
+def test_dispatch_once_preserves_systemic_gave_up_under_config_limit(
+    kanban_home, monkeypatch,
+):
+    """The complete dispatch tick must preserve a systemic breaker trip."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    _kb._recent_worker_exits.clear()
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        task_ids = []
+        now = int(time.time())
+        for i in range(3):
+            worker_pid = 871000 + i
+            tid = kb.create_task(conn, title=f"sys-dispatch-{i}", assignee="a")
+            conn.execute(
+                "UPDATE tasks SET status='running', worker_pid=?, "
+                "claim_lock=?, started_at=? WHERE id=?",
+                (worker_pid, f"{host}:wdisp{i}", now - 120, tid),
+            )
+            _kb._record_worker_exit(worker_pid, _signaled_status(9))
+            task_ids.append(tid)
+        conn.commit()
+
+        result = kb.dispatch_once(
+            conn,
+            failure_limit=2,
+            spawn_fn=lambda *a, **k: None,
+        )
+        assert set(result.crashed) == set(task_ids)
+        assert set(result.auto_blocked) == set(task_ids)
+        assert result.promoted == 0
+        for tid in task_ids:
+            assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_classify_worker_exit_recognizes_hard_stop_sentinel(kanban_home):
+    """EX_NOPERM marks "a plugin policy stopped this run", distinct from both a
+    quota wall (EX_TEMPFAIL, retry later) and a real crash."""
+    import hermes_cli.kanban_db as _kb
+
+    pid = 41337
+    _kb._record_worker_exit(pid, _exited_status(_kb.KANBAN_HARD_STOP_EXIT_CODE))
+    kind, code = _kb._classify_worker_exit(pid)
+    assert kind == "hard_stop"
+    assert code == _kb.KANBAN_HARD_STOP_EXIT_CODE
+    # And it must not collide with the rate-limit sentinel.
+    assert _kb.KANBAN_HARD_STOP_EXIT_CODE != _kb.KANBAN_RATE_LIMIT_EXIT_CODE
+
+
+def test_hard_stop_exit_blocks_task_without_counting_failure(
+    kanban_home, monkeypatch,
+):
+    """A plugin hard stop parks the card in ``blocked`` for a human — STICKY.
+
+    Regression for the cost-cap incident: the trip vetoed the worker's own
+    kanban_complete/kanban_block, so the worker exited without a terminal
+    transition. Classified as a clean exit that was a protocol violation, the
+    card was released to ``ready`` and respawned straight back into the same
+    cap. It must instead land in ``blocked`` — no failure counted (the task
+    isn't broken), no respawn (the budget hasn't changed) — and the block must
+    be sticky against ``recompute_ready`` (2026-08-05 review finding 1: a
+    non-sticky block with failures=0 is promoted back in the SAME tick).
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="hs", assignee="a")
+        pid = 80001
+
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, consecutive_failures=0 WHERE id=?",
+            (pid, tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(
+            pid, _exited_status(_kb.KANBAN_HARD_STOP_EXIT_CODE)
+        )
+
+        crashed = kb.detect_crashed_workers(conn)
+
+        # Not a crash, and not a rate-limited requeue.
+        assert tid not in crashed
+        assert tid not in getattr(
+            _kb.detect_crashed_workers, "_last_rate_limited", []
+        )
+        assert tid in getattr(
+            _kb.detect_crashed_workers, "_last_hard_stopped", []
+        )
+
+        task = kb.get_task(conn, tid)
+        # Terminal for the dispatcher: a ``blocked`` card is never respawned.
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 0
+        assert task.block_kind == "capability"
+        assert task.last_failure_error
+        assert "hard-stopped" in task.last_failure_error
+
+        outcomes = [
+            r["outcome"] for r in conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id=?", (tid,),
+            ).fetchall()
+        ]
+        assert "hard_stop" in outcomes
+        assert "crashed" not in outcomes
+
+        # STICKY: the hard_stop event pins the block against recompute_ready
+        # even though consecutive_failures is 0 and every failure_limit is
+        # satisfied. Only an explicit unblock clears it.
+        assert _kb._has_sticky_block(conn, tid) is True
+        assert kb.recompute_ready(conn, failure_limit=2) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_hard_stop_not_respawned_across_two_dispatch_ticks(
+    kanban_home, monkeypatch,
+):
+    """THE two-tick proof (2026-08-05 review findings 1 + 2).
+
+    The original patch parked the card with a raw ``status='blocked'`` UPDATE
+    and a non-sticky event: ``recompute_ready`` — which runs INSIDE the same
+    ``_dispatch_once_locked`` tick, after crash detection and before the ready
+    SELECT — promoted it straight back (failures=0 passes every limit) and the
+    spawn loop respawned it into the tripped cap. And the old no-respawn test
+    was vacuous: its card's assignee had no profile, so the profile_exists
+    gate skipped the spawn regardless of hard-stop semantics. Here
+    ``profile_exists`` is stubbed True, so a promoted card WOULD spawn — the
+    only thing standing between the card and a burn loop is the sticky block.
+    """
+    import hermes_cli.kanban_db as _kb
+    import hermes_cli.profiles as _profiles
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(_profiles, "profile_exists", lambda _name: True)
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="hs-two-tick", assignee="a")
+        pid = 80002
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(
+            pid, _exited_status(_kb.KANBAN_HARD_STOP_EXIT_CODE)
+        )
+
+        spawned = []
+
+        def _spawn(task, ws, **kw):
+            spawned.append(task.id)
+            return 4242
+
+        # Tick 1: the tick that reaps the hard-stopped worker.
+        result1 = _kb._dispatch_once_locked(conn, spawn_fn=_spawn)
+        assert result1.hard_stopped == [tid]
+        assert tid not in result1.crashed
+        assert tid not in result1.rate_limited
+        assert spawned == [], "hard-stopped card respawned in the same tick"
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        # Tick 2: a fresh tick with no crash to account — only recompute_ready
+        # and the spawn loop. A non-sticky block dies here.
+        result2 = _kb._dispatch_once_locked(conn, spawn_fn=_spawn)
+        assert result2.promoted == 0
+        assert spawned == [], "hard-stopped card respawned on the next tick"
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.get_task(conn, tid).consecutive_failures == 0
+
+
 def test_respawn_guard_defers_rate_limited_within_cooldown(
     kanban_home, monkeypatch,
 ):
@@ -363,6 +855,156 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# Deploy / gateway-restart carve-out: a worker killed by a graceful-
+# termination signal (SIGTERM / SIGINT) was torn down by an infrastructure
+# event (a systemd unit stop/restart during a deploy or cv-hermes-update, or
+# an operator Ctrl-C), NOT by a task failure. Because the dispatcher is
+# embedded in a gateway unit, a fleet-wide restart SIGTERMs the in-flight
+# workers AND the dispatcher together; on restart the dispatcher must not
+# score those graceful kills as crashes, or a single deploy window that
+# catches a task mid-run twice permanently ``gave_up``s an otherwise-healthy
+# card. Regression coverage for the 2026-07-20 deploy incident (a productive
+# skill-revise card parked after two SIGTERMs inside failure_limit=2).
+# ---------------------------------------------------------------------------
+
+
+def test_classify_worker_exit_recognizes_graceful_termination_signals(
+    kanban_home,
+):
+    import hermes_cli.kanban_db as _kb
+
+    # SIGTERM (15) and SIGINT (2) → interrupted, with or without a core bit.
+    for sig in (15, 2):
+        pid = 41000 + sig
+        _kb._record_worker_exit(pid, _signaled_status(sig))
+        assert _kb._classify_worker_exit(pid) == ("interrupted", sig)
+
+    # Genuine crash signals stay ``signaled`` and still count as crashes:
+    # SIGKILL (9, what the OOM killer sends), SIGSEGV (11), SIGABRT (6).
+    for sig in (9, 11, 6):
+        pid = 42000 + sig
+        _kb._record_worker_exit(pid, _signaled_status(sig, core=True))
+        assert _kb._classify_worker_exit(pid) == ("signaled", sig)
+
+
+def test_graceful_termination_requeues_without_counting_failure(
+    kanban_home, monkeypatch,
+):
+    """A SIGTERM/SIGINT kill releases the task to ``ready`` and leaves
+    ``consecutive_failures`` untouched — a deploy/restart window must never
+    trip the breaker, even when it catches the same task more times than
+    ``failure_limit``."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="deploy-kill", assignee="a")
+
+        # More SIGTERMs than DEFAULT_FAILURE_LIMIT (2). If any counted as a
+        # failure the task would be blocked well before the loop ends —
+        # exactly the incident being fixed.
+        for i in range(5):
+            pid = 50000 + i
+            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid=?, consecutive_failures=? "
+                "WHERE id=?",
+                (pid, 0, tid),
+            )
+            conn.commit()
+            # Alternate SIGTERM / SIGINT to prove both are carved out.
+            sig = 15 if i % 2 == 0 else 2
+            _kb._record_worker_exit(pid, _signaled_status(sig))
+
+            crashed = kb.detect_crashed_workers(conn)
+            # Interrupts are NOT crashes.
+            assert tid not in crashed
+            interrupted = getattr(
+                _kb.detect_crashed_workers, "_last_interrupted", []
+            )
+            assert tid in interrupted
+
+            task = kb.get_task(conn, tid)
+            assert task.status == "ready", (
+                f"kill {i}: should requeue ready, got {task.status}"
+            )
+            assert task.consecutive_failures == 0, (
+                f"kill {i}: graceful termination must not count a failure, "
+                f"got {task.consecutive_failures}"
+            )
+
+        # An ``interrupted`` run outcome was recorded (never ``crashed``).
+        outcomes = [
+            r["outcome"] for r in conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id=?", (tid,),
+            ).fetchall()
+        ]
+        assert "interrupted" in outcomes
+        assert "crashed" not in outcomes
+
+
+def test_respawn_guard_allows_interrupted_task_immediately(
+    kanban_home, monkeypatch,
+):
+    """An interrupt requeue carries no cooldown and no auth-blocker text, so
+    the respawn guard lets the dispatcher re-spawn on the next healthy tick
+    (unlike a rate-limit requeue, which defers on a cooldown)."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="deploy-kill-guard", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (51000, tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(51000, _signaled_status(15))  # SIGTERM
+
+        kb.detect_crashed_workers(conn)
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        # The stamped last_failure_error must not match the quota/auth
+        # blocker regex (which would defer the task forever with no failure
+        # counter to free it).
+        assert task.last_failure_error
+        assert not _kb._RESPAWN_BLOCKER_RE.search(task.last_failure_error)
+        # No rate-limit cooldown and no auth blocker → respawnable now.
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_dispatch_result_surfaces_interrupted(kanban_home, monkeypatch):
+    """``dispatch_once`` populates ``DispatchResult.interrupted`` for graceful
+    kills and keeps them out of ``crashed``/``rate_limited``."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="dispatch-interrupt", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (52000, tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(52000, _signaled_status(15))  # SIGTERM
+
+        # Stub spawn so the freed task isn't immediately re-claimed this tick.
+        result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
+        assert tid in result.interrupted
+        assert tid not in result.crashed
+        assert tid not in result.rate_limited
 
 
 # ---------------------------------------------------------------------------
@@ -792,6 +1434,9 @@ class TestSharedBoardPaths:
     ):
         # The dispatcher must pin board paths while stripping any unrelated
         # HERMES_SESSION_* identity inherited from the long-lived gateway.
+        # The one exception is HERMES_SESSION_SOURCE, which the dispatcher
+        # re-sets to its own `kanban` tag AFTER the strip — a value it owns,
+        # never one inherited from whatever the gateway last routed.
         default_home = tmp_path / ".hermes"
         default_home.mkdir()
         self._set_home(monkeypatch, tmp_path, default_home)
@@ -842,6 +1487,11 @@ class TestSharedBoardPaths:
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
         for key in sc._VAR_MAP:
+            if key == "HERMES_SESSION_SOURCE":
+                # Re-set by the dispatcher, so what matters is that it carries
+                # the worker's own tag rather than the inherited routing value.
+                assert env[key] == "kanban"
+                continue
             assert key not in env
 
 
