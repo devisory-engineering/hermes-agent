@@ -1062,10 +1062,72 @@ def load_jobs() -> List[Dict[str, Any]]:
     )
 
 
-def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
+_PAUSE_FIELDS = ("enabled", "state", "paused_at", "paused_reason")
+_PAUSE_VERSION_FIELD = "pause_updated_at"
+
+
+def _pause_state_version(job: Dict[str, Any]) -> Optional[datetime]:
+    """Return the pause/resume control version, including pre-version jobs."""
+    raw = job.get(_PAUSE_VERSION_FIELD) or job.get("paused_at")
+    if not isinstance(raw, str):
+        return None
+    try:
+        return _ensure_aware(datetime.fromisoformat(raw))
+    except ValueError:
+        return None
+
+
+def _merge_newer_external_pauses(
+    jobs: List[Dict[str, Any]],
+    authoritative_pause_job_ids: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Copy *jobs* and retain pause intent newer than the caller's snapshot."""
+    merged = copy.deepcopy(jobs)
+    jobs_file = _current_cron_store().jobs_file
+    try:
+        data = json.loads(jobs_file.read_text(encoding="utf-8-sig"), strict=False)
+    except (OSError, ValueError, TypeError):
+        return merged
+
+    persisted = data.get("jobs", []) if isinstance(data, dict) else data
+    if not isinstance(persisted, list):
+        return merged
+
+    authoritative = authoritative_pause_job_ids or set()
+    incoming_by_id = {
+        job.get("id"): job
+        for job in merged
+        if isinstance(job, dict) and job.get("id")
+    }
+    for disk_job in persisted:
+        if not isinstance(disk_job, dict):
+            continue
+        job_id = disk_job.get("id")
+        incoming = incoming_by_id.get(job_id)
+        if not incoming or job_id in authoritative:
+            continue
+        disk_version = _pause_state_version(disk_job)
+        incoming_version = _pause_state_version(incoming)
+        if disk_version is None:
+            continue
+        if incoming_version is not None and disk_version <= incoming_version:
+            continue
+        for field in (*_PAUSE_FIELDS, _PAUSE_VERSION_FIELD):
+            incoming[field] = disk_job.get(field)
+    return merged
+
+
+def _save_jobs_unlocked(
+    jobs: List[Dict[str, Any]],
+    *,
+    authoritative_pause_job_ids: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
     """Save all jobs to storage. Caller must hold _jobs_lock()."""
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
+    jobs_to_write = _merge_newer_external_pauses(
+        jobs, authoritative_pause_job_ids
+    )
     # Snapshot the current owner BEFORE the atomic replace so a privileged
     # writer (root CLI in Docker) can hand ownership back to the gateway user
     # afterwards instead of locking its ticker out (#68483). When the file is
@@ -1082,12 +1144,13 @@ def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
     fd, tmp_path = tempfile.mkstemp(dir=str(jobs_file.parent), suffix='.tmp', prefix='.jobs_')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump({"jobs": jobs, "updated_at": _hermes_now().isoformat()}, f, indent=2)
+            json.dump({"jobs": jobs_to_write, "updated_at": _hermes_now().isoformat()}, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
         atomic_replace(tmp_path, jobs_file)
         _secure_file(jobs_file)
         _preserve_file_ownership(jobs_file, _stat_before)
+        return jobs_to_write
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -1097,7 +1160,7 @@ def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
 
 
 def save_jobs(jobs: List[Dict[str, Any]]):
-    """Save all jobs to storage."""
+    """Save all jobs, retaining newer on-disk pauses from stale snapshots."""
     with _jobs_lock():
         _save_jobs_unlocked(jobs)
 
@@ -1532,6 +1595,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            pause_fields_changed = bool(set(updates).intersection(_PAUSE_FIELDS))
+            if pause_fields_changed:
+                updated[_PAUSE_VERSION_FIELD] = _hermes_now().isoformat()
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
@@ -1600,8 +1666,14 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updated["next_run_at"] = next_run
 
             jobs[i] = updated
-            save_jobs(jobs)
-            return _normalize_job_record(jobs[i])
+            saved_jobs = _save_jobs_unlocked(
+                jobs,
+                authoritative_pause_job_ids=(
+                    {job_id} if pause_fields_changed else None
+                ),
+            )
+            saved = next(job for job in saved_jobs if job.get("id") == job_id)
+            return _normalize_job_record(saved)
     return None
 
 

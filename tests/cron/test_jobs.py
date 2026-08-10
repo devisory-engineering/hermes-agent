@@ -1,5 +1,6 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
+import copy
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
@@ -261,6 +262,23 @@ class TestPauseResumeJob:
         assert paused["state"] == "paused"
         assert paused["paused_reason"] == "user paused"
 
+    def test_resume_clears_persisted_pause_state(self, tmp_cron_dir):
+        job = create_job(prompt="Resume me", schedule="every 1h")
+        pause_job(job["id"], reason="maintenance")
+
+        resumed = resume_job(job["id"])
+
+        assert resumed is not None
+        assert resumed["enabled"] is True
+        assert resumed["state"] == "scheduled"
+        assert resumed["paused_at"] is None
+        assert resumed["paused_reason"] is None
+        persisted = get_job(job["id"])
+        assert persisted["enabled"] is True
+        assert persisted["state"] == "scheduled"
+        assert persisted["paused_at"] is None
+        assert persisted["paused_reason"] is None
+
 
     def test_resume_rejects_past_oneshot(self, tmp_cron_dir, monkeypatch):
         """Resuming a paused one-shot whose time is now in the past must raise
@@ -322,6 +340,89 @@ class TestMarkJobRun:
         updated = get_job(job["id"])
         assert updated["repeat"]["completed"] == 1
         assert updated["last_status"] == "ok"
+        assert updated["last_run_at"] is not None
+        assert updated["state"] == "scheduled"
+        assert updated["next_run_at"] is not None
+
+    def test_external_pause_survives_mark_job_run_from_stale_snapshot(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A scheduler completion must not resurrect a newer CLI pause."""
+        import cron.jobs as cron_jobs
+
+        job = create_job(prompt="Pause while running", schedule="every 1h")
+        scheduler_snapshot = load_jobs()
+        paused = pause_job(job["id"], reason="runaway breaker")
+        assert paused is not None
+
+        real_load_jobs = cron_jobs.load_jobs
+        monkeypatch.setattr(
+            cron_jobs,
+            "load_jobs",
+            lambda: copy.deepcopy(scheduler_snapshot),
+        )
+
+        mark_job_run(job["id"], success=False, error="stopped")
+
+        persisted = next(j for j in real_load_jobs() if j["id"] == job["id"])
+        assert persisted["enabled"] is False
+        assert persisted["state"] == "paused"
+        assert persisted["paused_at"] == paused["paused_at"]
+        assert persisted["paused_reason"] == "runaway breaker"
+        assert persisted["last_status"] == "error"
+        assert persisted["last_error"] == "stopped"
+
+    def test_external_resume_survives_mark_job_run_from_stale_paused_snapshot(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A scheduler completion must not reinstate an older pause."""
+        import cron.jobs as cron_jobs
+
+        job = create_job(prompt="Resume while running", schedule="every 1h")
+        pause_job(job["id"], reason="maintenance")
+        scheduler_snapshot = load_jobs()
+        resumed = resume_job(job["id"])
+        assert resumed is not None
+
+        real_load_jobs = cron_jobs.load_jobs
+        monkeypatch.setattr(
+            cron_jobs,
+            "load_jobs",
+            lambda: copy.deepcopy(scheduler_snapshot),
+        )
+
+        mark_job_run(job["id"], success=True)
+
+        persisted = next(j for j in real_load_jobs() if j["id"] == job["id"])
+        assert persisted["enabled"] is True
+        assert persisted["state"] == "scheduled"
+        assert persisted["paused_at"] is None
+        assert persisted["paused_reason"] is None
+        assert persisted["last_status"] == "ok"
+        assert persisted["last_run_at"] is not None
+
+    def test_update_returns_pause_state_restored_during_save(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """The update response must match pause state reconciled to disk."""
+        import cron.jobs as cron_jobs
+
+        job = create_job(prompt="Rename while paused", schedule="every 1h")
+        scheduler_snapshot = load_jobs()
+        pause_job(job["id"], reason="maintenance")
+        monkeypatch.setattr(
+            cron_jobs,
+            "load_jobs",
+            lambda: copy.deepcopy(scheduler_snapshot),
+        )
+
+        updated = update_job(job["id"], {"name": "renamed"})
+
+        assert updated is not None
+        assert updated["name"] == "renamed"
+        assert updated["enabled"] is False
+        assert updated["state"] == "paused"
+        assert updated["paused_reason"] == "maintenance"
 
     def test_repeat_limit_retains_completed_record(self, tmp_cron_dir):
         """A finished one-shot must stay inspectable, not vanish from the store."""
