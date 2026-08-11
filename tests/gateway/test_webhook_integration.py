@@ -456,3 +456,116 @@ class TestExecDelivery:
             )
         # input kwarg should be None when stdin is disabled
         assert mock_run.call_args.kwargs["input"] is None
+
+    @pytest.mark.asyncio
+    async def test_exec_delivery_can_pipe_complete_payload_json(self):
+        adapter = _make_adapter({})
+        payload = {
+            "Type": "Notification",
+            "MessageId": "sns-message-001",
+            "Message": "signed alarm body",
+        }
+        delivery = {
+            "deliver": "exec",
+            "deliver_extra": {
+                "cmd": ["/usr/bin/cat"],
+                "stdin_format": "payload_json",
+            },
+            "payload": payload,
+        }
+        mock_result = MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch(
+            "gateway.platforms.webhook.subprocess.run",
+            return_value=mock_result,
+        ) as mock_run:
+            result = await adapter._deliver_exec("truncated prompt", delivery)
+
+        assert result.success is True
+        assert mock_run.call_args.kwargs["input"] == json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+
+class TestSnsExecAuth:
+    @staticmethod
+    def _route():
+        return {
+            "auth": "sns",
+            "events": ["Notification", "SubscriptionConfirmation"],
+            "prompt": "SNS envelope delegated to deterministic handler",
+            "deliver_only": True,
+            "deliver": "exec",
+            "deliver_extra": {
+                "cmd": ["/opt/pantheon/cw-alarm-webhook.py"],
+                "stdin_format": "payload_json",
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_static_sns_route_is_valid_on_public_bind(self):
+        adapter = _make_adapter(
+            {"cw-alarm": self._route()}, host="0.0.0.0", port=0
+        )
+        try:
+            with patch.object(adapter, "_reload_dynamic_routes"):
+                assert await adapter.connect() is True
+        finally:
+            await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_sns_auth_rejects_any_non_exec_route(self):
+        route = self._route()
+        route["deliver"] = "slack"
+        adapter = _make_adapter({"cw-alarm": route}, port=0)
+
+        with patch.object(adapter, "_reload_dynamic_routes"):
+            with pytest.raises(ValueError, match="static deliver_only exec route"):
+                await adapter.connect()
+
+    @pytest.mark.asyncio
+    async def test_sns_type_and_message_id_reach_direct_exec_delivery(self):
+        adapter = _make_adapter({"cw-alarm": self._route()})
+        adapter._direct_deliver = AsyncMock(return_value=SendResult(success=True))
+        payload = {
+            "Type": "Notification",
+            "MessageId": "sns-message-002",
+            "Signature": "handler-validates-this",
+            "Message": "alarm JSON",
+        }
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            response = await cli.post("/webhooks/cw-alarm", json=payload)
+
+        assert response.status == 200
+        body = await response.json()
+        assert body["event"] == "Notification"
+        assert body["delivery_id"] == "sns-message-002"
+        delivery = adapter._direct_deliver.await_args.args[1]
+        assert delivery["payload"] == payload
+
+    @pytest.mark.asyncio
+    async def test_failed_sns_exec_delivery_is_retried_not_deduplicated(self):
+        adapter = _make_adapter({"cw-alarm": self._route()})
+        adapter._direct_deliver = AsyncMock(
+            side_effect=[
+                SendResult(success=False, error="certificate fetch failed"),
+                SendResult(success=True),
+            ]
+        )
+        payload = {
+            "Type": "Notification",
+            "MessageId": "sns-message-retry",
+            "Signature": "handler-validates-this",
+            "Message": "alarm JSON",
+        }
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            first = await cli.post("/webhooks/cw-alarm", json=payload)
+            second = await cli.post("/webhooks/cw-alarm", json=payload)
+
+        assert first.status == 502
+        assert second.status == 200
+        assert adapter._direct_deliver.await_count == 2

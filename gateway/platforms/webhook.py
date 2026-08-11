@@ -8,7 +8,9 @@ source or to another configured platform.
 Configuration lives in config.yaml under platforms.webhook.extra.routes.
 Each route defines:
   - events: which event types to accept (header-based filtering)
-  - secret: HMAC secret for signature validation (REQUIRED)
+  - secret: HMAC secret for signature validation (REQUIRED for auth=hmac)
+  - auth: authentication mode (default hmac; sns delegates signed-envelope
+    verification to a static deterministic exec handler)
   - prompt: template string formatted with the webhook payload
   - skills: optional list of skills to load for the agent
   - deliver: where to send the response (github_comment, telegram, exec, etc.)
@@ -26,7 +28,10 @@ shell interpolation).  Useful for deterministic routing/dispatch where
 the LLM's reasoning isn't needed.
 
 Security:
-  - HMAC secret is required per route (validated at startup)
+  - HMAC secret is required per ordinary route (validated at startup)
+  - ``auth: sns`` is accepted only on static ``deliver_only`` exec routes
+    whose handler receives the complete parsed envelope as JSON on stdin;
+    that handler must validate AWS's signed SNS envelope before acting
   - Rate limiting per route (fixed-window, configurable)
   - Idempotency cache prevents duplicate agent runs on webhook retries
   - Body size limits checked before reading payload
@@ -262,8 +267,31 @@ class WebhookAdapter(BasePlatformAdapter):
         # Load agent-created subscriptions before validating
         self._reload_dynamic_routes()
 
-        # Validate routes at startup — secret is required per route
+        # Validate routes at startup. Ordinary routes require HMAC. The sole
+        # exception is a static, deterministic exec route whose handler owns
+        # validation of the AWS-signed SNS envelope it receives intact.
         for name, route in self._routes.items():
+            auth_mode = route.get("auth", "hmac")
+            if auth_mode not in {"hmac", "sns"}:
+                raise ValueError(
+                    f"[webhook] Route '{name}' has unsupported auth mode "
+                    f"'{auth_mode}'."
+                )
+            if auth_mode == "sns":
+                extra = route.get("deliver_extra", {})
+                if (
+                    name not in self._static_routes
+                    or not route.get("deliver_only")
+                    or route.get("deliver") != "exec"
+                    or extra.get("stdin_format") != "payload_json"
+                ):
+                    raise ValueError(
+                        f"[webhook] Route '{name}' uses auth=sns, which is "
+                        "allowed only for a static deliver_only exec route "
+                        "with deliver_extra.stdin_format=payload_json."
+                    )
+                continue
+
             secret = route.get("secret", self._global_secret)
             if not secret:
                 raise ValueError(
@@ -513,6 +541,13 @@ class WebhookAdapter(BasePlatformAdapter):
             for k, v in data.items():
                 if k in self._static_routes:
                     continue
+                if v.get("auth", "hmac") != "hmac":
+                    logger.warning(
+                        "[webhook] Dynamic route '%s' skipped: external auth "
+                        "modes are reserved for static operator routes.",
+                        k,
+                    )
+                    continue
                 effective_secret = v.get("secret", self._global_secret)
                 if not effective_secret:
                     logger.warning(
@@ -666,28 +701,30 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"error": "Payload too large"}, status=413
             )
 
-        # Validate HMAC signature FIRST (skip only for the explicit local-test
-        # INSECURE_NO_AUTH mode). Missing/empty secrets must fail closed here,
-        # not only during connect(), so direct handler reuse cannot turn a
-        # network webhook route into an unauthenticated agent-dispatch surface.
-        secret = route_config.get("secret", self._global_secret)
-        if not secret:
-            logger.error(
-                "[webhook] Route %s has no HMAC secret; refusing request",
-                route_name,
-            )
-            return web.json_response(
-                {"error": "Webhook route is missing an HMAC secret"},
-                status=403,
-            )
-        if secret != _INSECURE_NO_AUTH:
-            if not self._validate_signature(request, raw_body, secret):
-                logger.warning(
-                    "[webhook] Invalid signature for route %s", route_name
+        # Validate HMAC FIRST for ordinary routes. auth=sns is constrained at
+        # startup to a static deterministic exec handler; that handler validates
+        # the SNS certificate chain, canonical signature, and topic before any
+        # side effect. A non-zero handler exit rejects the delivery with 502.
+        auth_mode = route_config.get("auth", "hmac")
+        if auth_mode != "sns":
+            secret = route_config.get("secret", self._global_secret)
+            if not secret:
+                logger.error(
+                    "[webhook] Route %s has no HMAC secret; refusing request",
+                    route_name,
                 )
                 return web.json_response(
-                    {"error": "Invalid signature"}, status=401
+                    {"error": "Webhook route is missing an HMAC secret"},
+                    status=403,
                 )
+            if secret != _INSECURE_NO_AUTH:
+                if not self._validate_signature(request, raw_body, secret):
+                    logger.warning(
+                        "[webhook] Invalid signature for route %s", route_name
+                    )
+                    return web.json_response(
+                        {"error": "Invalid signature"}, status=401
+                    )
 
         # ── Rate limiting (after auth) ───────────────────────────
         now = time.time()
@@ -716,6 +753,7 @@ class WebhookAdapter(BasePlatformAdapter):
         event_type = (
             request.headers.get("X-GitHub-Event", "")
             or request.headers.get("X-GitLab-Event", "")
+            or payload.get("Type", "")
             or payload.get("event_type", "")
             or payload.get("type", "")
             or "unknown"
@@ -811,7 +849,10 @@ class WebhookAdapter(BasePlatformAdapter):
             "X-GitHub-Delivery",
             request.headers.get(
                 "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+                request.headers.get(
+                    "X-Request-ID",
+                    payload.get("MessageId", str(int(time.time() * 1000))),
+                ),
             ),
         )
 
@@ -852,6 +893,10 @@ class WebhookAdapter(BasePlatformAdapter):
             try:
                 result = await self._direct_deliver(prompt, delivery)
             except Exception:
+                # A direct handler failure is retriable. Do not let the
+                # pre-delivery idempotency reservation turn SNS's next attempt
+                # into a false-success duplicate that silently loses an alarm.
+                self._seen_deliveries.pop(delivery_id, None)
                 logger.exception(
                     "[webhook] direct-deliver failed route=%s delivery=%s",
                     route_name,
@@ -874,6 +919,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
             # Delivery attempted but target rejected it — surface as 502
             # with a generic error (don't leak adapter-level detail).
+            self._seen_deliveries.pop(delivery_id, None)
             logger.warning(
                 "[webhook] direct-deliver target rejected route=%s target=%s error=%s",
                 route_name,
@@ -1321,6 +1367,10 @@ class WebhookAdapter(BasePlatformAdapter):
             is piped to the subprocess's stdin.  Set falsy to skip and
             just pass the rendered prompt via argv if your handler
             prefers that.
+          - ``stdin_format`` (optional, default ``prompt``): use
+            ``payload_json`` to serialize the complete parsed webhook payload
+            instead of the rendered prompt. Required by ``auth: sns`` so the
+            exec handler can verify every canonical signed-envelope field.
 
         Returns SendResult(success=True) on exit 0.  Returns
         success=False with stderr on non-zero exit, FileNotFoundError
@@ -1351,11 +1401,28 @@ class WebhookAdapter(BasePlatformAdapter):
 
         timeout = float(extra.get("timeout", _DEFAULT_EXEC_TIMEOUT))
         send_stdin = bool(extra.get("stdin", True))
+        stdin_format = extra.get("stdin_format", "prompt")
+        if stdin_format not in {"prompt", "payload_json"}:
+            logger.error(
+                "[webhook] exec delivery has unsupported stdin_format: %r",
+                stdin_format,
+            )
+            return SendResult(
+                success=False,
+                error=f"unsupported exec stdin_format: {stdin_format}",
+            )
+        stdin_content = content
+        if stdin_format == "payload_json":
+            stdin_content = json.dumps(
+                delivery.get("payload"),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
 
         try:
             result = subprocess.run(
                 cmd,
-                input=content if send_stdin else None,
+                input=stdin_content if send_stdin else None,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
