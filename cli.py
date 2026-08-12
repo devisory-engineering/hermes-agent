@@ -18518,10 +18518,23 @@ def main(
                             try:
                                 from hermes_cli.kanban_db import (
                                     KANBAN_HARD_STOP_EXIT_CODE as _HS_CODE,
+                                    record_hard_stop_latch as _hs_latch,
                                 )
                                 _exit_code = _HS_CODE
+                                _hs_latch(
+                                    os.environ.get("HERMES_KANBAN_TASK", ""),
+                                    pid=os.getpid(),
+                                    run_id=os.environ.get("HERMES_KANBAN_RUN_ID") or None,
+                                    reason="plugin hard stop",
+                                )
                             except Exception:
-                                _exit_code = 1
+                                try:
+                                    from hermes_cli.kanban_db import (
+                                        KANBAN_HARD_STOP_EXIT_CODE as _HS_CODE,
+                                    )
+                                    _exit_code = _HS_CODE
+                                except Exception:
+                                    _exit_code = 1
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails
@@ -18566,6 +18579,13 @@ def main(
                     try:
                         from hermes_cli.kanban_db import (
                             KANBAN_HARD_STOP_EXIT_CODE as _HS_CODE,
+                            record_hard_stop_latch as _hs_latch,
+                        )
+                        _hs_latch(
+                            os.environ.get("HERMES_KANBAN_TASK", ""),
+                            pid=os.getpid(),
+                            run_id=os.environ.get("HERMES_KANBAN_RUN_ID") or None,
+                            reason="plugin hard stop",
                         )
                     except Exception:
                         _HS_CODE = 1

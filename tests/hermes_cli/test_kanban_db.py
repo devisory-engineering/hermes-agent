@@ -812,6 +812,130 @@ def test_hard_stop_not_respawned_across_two_dispatch_ticks(
         assert kb.get_task(conn, tid).consecutive_failures == 0
 
 
+
+def test_hard_stop_latch_roundtrip(kanban_home):
+    """Latch is durable JSON next to the board DB; consume is once-only + pid-scoped."""
+    import hermes_cli.kanban_db as _kb
+
+    tid = "t_latch_roundtrip"
+    path = _kb.record_hard_stop_latch(
+        tid, pid=4242, run_id="99", reason="cost cap",
+    )
+    assert path is not None and path.is_file()
+    assert path.parent == _kb.hard_stop_latch_dir()
+    # Wrong pid does not consume.
+    assert _kb.consume_hard_stop_latch(tid, worker_pid=9999) is None
+    assert path.is_file()
+    data = _kb.consume_hard_stop_latch(tid, worker_pid=4242)
+    assert data is not None
+    assert data["task_id"] == tid
+    assert data["pid"] == 4242
+    assert data["exit_code"] == _kb.KANBAN_HARD_STOP_EXIT_CODE
+    assert not path.exists()
+    # Second consume is a miss.
+    assert _kb.consume_hard_stop_latch(tid, worker_pid=4242) is None
+
+
+def test_hard_stop_latch_recovers_unknown_wait_status(
+    kanban_home, monkeypatch,
+):
+    """THE residual after #863 / exit-77 (2026-08-12 program:t_d69bfb97).
+
+    Plugin hard-stop latched and session_end fired with no soft-stop bleed,
+    but the dispatcher reaped the worker as ``pid not alive`` (wait status
+    missing → kind ``unknown``) and released the card to ``ready``. A second
+    run burned straight back into the same $4 cap.
+
+    With the durable latch present, missing/unknown wait status MUST still
+    classify as ``hard_stop``: outcome hard_stop, status blocked,
+    block_kind=capability, sticky — never crashed→ready→respawn.
+    """
+    import hermes_cli.kanban_db as _kb
+    import hermes_cli.profiles as _profiles
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(_profiles, "profile_exists", lambda _name: True)
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="hs-latch-unknown", assignee="a")
+        pid = 90077
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid),
+        )
+        conn.commit()
+
+        # NO _record_worker_exit — wait status is lost (the live failure mode).
+        # Worker DID write the durable latch before dying.
+        assert _kb.record_hard_stop_latch(
+            tid, pid=pid, reason="Cost budget exceeded",
+        ) is not None
+        assert _kb._classify_worker_exit(pid) == ("unknown", None)
+
+        spawned = []
+
+        def _spawn(task, ws, **kw):
+            spawned.append(task.id)
+            return 4242
+
+        result = _kb._dispatch_once_locked(conn, spawn_fn=_spawn)
+        assert result.hard_stopped == [tid]
+        assert tid not in result.crashed
+        assert spawned == [], "latch-classified hard_stop must not respawn"
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "capability"
+        assert task.consecutive_failures == 0
+        assert "hard-stopped" in (task.last_failure_error or "")
+        outcomes = [
+            r["outcome"] for r in conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id=?", (tid,),
+            ).fetchall()
+        ]
+        assert "hard_stop" in outcomes
+        assert "crashed" not in outcomes
+        assert _kb._has_sticky_block(conn, tid) is True
+        # Latch consumed — cannot poison a later run of the same card.
+        assert _kb.consume_hard_stop_latch(tid, worker_pid=pid) is None
+
+        # Next tick still does not respawn (sticky block).
+        result2 = _kb._dispatch_once_locked(conn, spawn_fn=_spawn)
+        assert result2.promoted == 0
+        assert spawned == []
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_hard_stop_latch_does_not_override_live_pid(
+    kanban_home, monkeypatch,
+):
+    """A latch alone must not reclaim a still-alive worker."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="hs-latch-alive", assignee="a")
+        pid = 90078
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid),
+        )
+        conn.commit()
+        _kb.record_hard_stop_latch(tid, pid=pid, reason="stale")
+        crashed = kb.detect_crashed_workers(conn)
+        assert crashed == []
+        assert tid not in getattr(
+            _kb.detect_crashed_workers, "_last_hard_stopped", []
+        )
+        assert kb.get_task(conn, tid).status == "running"
+        # Latch left in place for when the pid actually dies.
+        assert _kb._hard_stop_latch_path(tid).is_file()
+
+
 def test_respawn_guard_defers_rate_limited_within_cooldown(
     kanban_home, monkeypatch,
 ):

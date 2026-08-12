@@ -6348,6 +6348,27 @@ def run_conversation(
                     agent._session_messages = messages
                     agent._persist_session(messages, conversation_history)
                     agent._plugin_hard_stop_message = _hard_stop_msg
+                    # Durable side-channel for kanban: write the hard-stop latch
+                    # HERE (as soon as the trip is consumed), not only at the
+                    # process exit(77) path. Live 2026-08-12 lost exit 77 after
+                    # session_end (Langfuse teardown noise / reap race) and the
+                    # dispatcher reaped "pid not alive" → crashed → respawn.
+                    # A latch next to kanban.db still classifies correctly.
+                    _kanban_tid = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+                    if _kanban_tid:
+                        try:
+                            from hermes_cli.kanban_db import record_hard_stop_latch
+
+                            record_hard_stop_latch(
+                                _kanban_tid,
+                                pid=os.getpid(),
+                                run_id=os.environ.get("HERMES_KANBAN_RUN_ID") or None,
+                                reason=_hard_stop_msg,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "hard-stop latch write failed", exc_info=True
+                            )
                     logger.warning("plugin hard stop: %s", _hard_stop_msg)
                     break
 

@@ -410,6 +410,15 @@ KANBAN_RATE_LIMIT_EXIT_CODE = 75
 # cap. 77 == BSD ``EX_NOPERM`` (sysexits.h): the run was denied by policy.
 KANBAN_HARD_STOP_EXIT_CODE = 77
 
+# Durable side-channel for plugin hard stops when exit 77 is lost.
+# Workers write one JSON latch per task under the board DB parent before
+# exiting; detect_crashed_workers consumes it if wait-status classification
+# is missing/unknown (live 2026-08-12: cost-cap hard_stop reaped as
+# "pid not alive" → crashed → ready → respawn). Atomic tmp+rename; TTL
+# bounds stale files. Fail-closed on I/O errors (no latch → prior behavior).
+HARD_STOP_LATCH_DIRNAME = "hard-stop-latches"
+HARD_STOP_LATCH_TTL_SECONDS = 3600
+
 
 # Signals that mean "gracefully asked to stop", NOT "the task failed".
 # A worker reaped as killed by one of these was almost certainly torn down
@@ -7065,6 +7074,133 @@ _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
 
+def hard_stop_latch_dir(board: Optional[str] = None) -> Path:
+    """Directory for durable hard-stop latches for ``board`` (or current).
+
+    Sits next to the board's ``kanban.db`` so the dispatcher and the worker
+    converge on the same path via ``HERMES_KANBAN_DB`` / board resolution
+    without a new env var. Created on demand by :func:`record_hard_stop_latch`.
+    """
+    return kanban_db_path(board=board).parent / HARD_STOP_LATCH_DIRNAME
+
+
+def _hard_stop_latch_path(task_id: str, board: Optional[str] = None) -> Path:
+    # Task ids are ``t_<hex>``; still sanitize so a hostile id cannot escape.
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", (task_id or "").strip()) or "_unknown"
+    return hard_stop_latch_dir(board=board) / f"{safe}.json"
+
+
+def record_hard_stop_latch(
+    task_id: str,
+    *,
+    pid: Optional[int] = None,
+    run_id: Optional[str] = None,
+    reason: str = "",
+    board: Optional[str] = None,
+) -> Optional[Path]:
+    """Best-effort durable marker: this kanban worker was plugin-hard-stopped.
+
+    Called from the worker process as soon as a plugin hard stop is consumed
+    (and again on the exit(77) path). The dispatcher consults the latch when
+    classifying a dead worker whose wait status was lost — without it, a
+    hard-stopped card is reaped as ``crashed`` / ``pid not alive``, released
+    to ``ready``, and respawned into the same cap.
+
+    Atomic tmp+rename. Returns the latch path on success, else ``None``.
+    Never raises into the caller: a failed latch must not prevent exit 77.
+    """
+    tid = (task_id or "").strip()
+    if not tid:
+        return None
+    try:
+        dest = _hard_stop_latch_path(tid, board=board)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "task_id": tid,
+            "pid": int(pid) if pid else None,
+            "run_id": str(run_id) if run_id not in (None, "") else None,
+            "reason": (reason or "")[:500],
+            "ts": time.time(),
+            "exit_code": KANBAN_HARD_STOP_EXIT_CODE,
+        }
+        tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, dest)
+        return dest
+    except Exception:
+        # Best-effort only — exit 77 remains the primary signal.
+        try:
+            if "tmp" in locals() and tmp.exists():  # type: ignore[name-defined]
+                tmp.unlink(missing_ok=True)  # type: ignore[name-defined]
+        except Exception:
+            pass
+        return None
+
+
+def consume_hard_stop_latch(
+    task_id: str,
+    *,
+    worker_pid: Optional[int] = None,
+    board: Optional[str] = None,
+    ttl_seconds: Optional[int] = None,
+) -> Optional[dict]:
+    """Return and delete a fresh hard-stop latch for ``task_id``, if any.
+
+    ``worker_pid`` when provided must match the latch's pid (when the latch
+    recorded one) so a later run of the same card cannot inherit a stale
+    marker. Expired latches are deleted and ignored. Missing/corrupt files
+    yield ``None`` (fail closed → ordinary crash classification).
+    """
+    tid = (task_id or "").strip()
+    if not tid:
+        return None
+    path = _hard_stop_latch_path(tid, board=board)
+    try:
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return None
+        if not isinstance(data, dict):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return None
+        ttl = HARD_STOP_LATCH_TTL_SECONDS if ttl_seconds is None else int(ttl_seconds)
+        ts = data.get("ts")
+        try:
+            ts_f = float(ts)
+        except (TypeError, ValueError):
+            ts_f = 0.0
+        if ttl >= 0 and ts_f and (time.time() - ts_f) > ttl:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return None
+        latch_pid = data.get("pid")
+        if worker_pid is not None and latch_pid not in (None, "", 0):
+            try:
+                if int(latch_pid) != int(worker_pid):
+                    return None
+            except (TypeError, ValueError):
+                return None
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            # Still honor the latch even if unlink races; next tick cleans up.
+            pass
+        return data
+    except Exception:
+        return None
+
+
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped child's exit status for later classification.
 
@@ -7122,7 +7258,9 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       ``SIGKILL``, so out-of-memory deaths correctly stay in this bucket.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
       something else, or died between reap tick and liveness check). Fall
-      back to existing crashed-counter behavior.
+      back to existing crashed-counter behavior unless a durable hard-stop
+      latch is present (see :func:`consume_hard_stop_latch`, applied by
+      ``detect_crashed_workers``).
 
     ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
     ``nonzero_exit``) or the signal number (for ``signaled`` /
@@ -7821,6 +7959,21 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
+            # Side-channel: if exit 77 never reached the reap registry
+            # (teardown crash, init reaped the child, wait-status lost), a
+            # durable latch written by the worker still proves the run was
+            # plugin-hard-stopped. Latch wins over every other kind so a
+            # lost wait status cannot turn a budget trip into crashed→ready
+            # →respawn (2026-08-12 program:t_d69bfb97 / t_eaa65869).
+            if kind != "hard_stop":
+                _latch = consume_hard_stop_latch(row["id"], worker_pid=pid)
+                if _latch is not None:
+                    kind = "hard_stop"
+                    code = KANBAN_HARD_STOP_EXIT_CODE
+            elif kind == "hard_stop":
+                # Exit 77 already classified — drop a matching latch so it
+                # cannot outlive this reclaim and poison a later run.
+                consume_hard_stop_latch(row["id"], worker_pid=pid)
             rate_limited_exit = False
             interrupted_exit = False
             hard_stop_exit = False
