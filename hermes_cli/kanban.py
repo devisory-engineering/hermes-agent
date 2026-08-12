@@ -841,6 +841,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_asg.add_argument("--json", action="store_true")
 
+    # --- quiesce / resume ---
+    p_q = sub.add_parser(
+        "quiesce",
+        help="Take a profile out of service: the dispatcher stops spawning "
+             "workers for it. Stopping the profile's own gateway does NOT do "
+             "this — workers are children of the orchestrator's gateway.",
+    )
+    p_q.add_argument("assignee")
+    p_q.add_argument(
+        "--kill", action="store_true",
+        help="Also terminate that assignee's in-flight workers. Without this, "
+             "running tasks finish first (the polite stop).",
+    )
+    p_r = sub.add_parser("resume", help="Put a quiesced profile back in service.")
+    p_r.add_argument("assignee")
+    p_ql = sub.add_parser("quiesced", help="List profiles currently out of service.")
+    p_ql.add_argument("--json", action="store_true")
+
     # --- context --- (for spawned workers)
     p_ctx = sub.add_parser(
         "context",
@@ -1077,6 +1095,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "runs":     _cmd_runs,
             "heartbeat": _cmd_heartbeat,
             "assignees": _cmd_assignees,
+            "quiesce": _cmd_quiesce,
+            "resume": _cmd_resume,
+            "quiesced": _cmd_quiesced,
             "notify-subscribe":   _cmd_notify_subscribe,
             "notify-list":        _cmd_notify_list,
             "notify-unsubscribe": _cmd_notify_unsubscribe,
@@ -1450,6 +1471,102 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
         print(f"cannot heartbeat {args.task_id} (not running?)", file=sys.stderr)
         return 1
     print(f"Heartbeat recorded for {args.task_id}")
+    return 0
+
+
+def _cmd_quiesce(args: argparse.Namespace) -> int:
+    """Take a profile out of service.
+
+    Necessary because ``systemctl stop hermes-gateway-<profile>`` is not a
+    stop. The dispatcher runs in the orchestrator's gateway and spawns
+    ``hermes -p <assignee>`` as its own child, so those workers keep running
+    — and keep claiming new tasks — while systemd reports the profile's unit
+    inactive. This marker is what the dispatcher actually honours.
+    """
+    name = (args.assignee or "").strip()
+    if not name or "/" in name or name in (".", ".."):
+        print(f"refusing to quiesce invalid assignee {args.assignee!r}")
+        return 2
+    d = kb.quiesce_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    # Record provenance. Tooling that clears markers on a unit restart must be
+    # able to tell "the stop wrote this" from "a human parked this" — otherwise
+    # an unrelated deploy silently puts a deliberately stopped agent back to
+    # work, which is the failure this whole mechanism exists to prevent.
+    (d / name).write_text(f"operator:{os.environ.get('USER') or 'unknown'}\n")
+    print(f"quiesced {name} — the dispatcher will not spawn new workers for it")
+    print("  survives restarts and deploys; release with `hermes kanban resume`")
+    killed = 0
+    if args.kill:
+        import signal as _signal
+        for pid, cmdline in _iter_worker_processes(name):
+            try:
+                os.kill(pid, _signal.SIGTERM)
+                killed += 1
+                print(f"  terminated pid {pid}: {cmdline[:70]}")
+            except OSError as exc:
+                print(f"  could not terminate pid {pid}: {exc}")
+        if not killed:
+            print("  no in-flight workers found")
+    else:
+        inflight = sum(1 for _ in _iter_worker_processes(name))
+        if inflight:
+            print(f"  {inflight} worker(s) still running; pass --kill to stop them too")
+    return 0
+
+
+def _iter_worker_processes(assignee: str):
+    """Yield ``(pid, cmdline)`` for live workers running as ``assignee``.
+
+    Matched on the spawn shape ``hermes -p <assignee> ... work kanban task``
+    rather than on process ownership, because ownership is exactly what is
+    misleading here — the workers belong to the orchestrator's gateway.
+    """
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return
+    needle_p = f"-p\x00{assignee}\x00"
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes().decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "hermes" not in raw or "kanban" not in raw:
+            continue
+        if needle_p in raw and "task" in raw:
+            yield int(entry.name), raw.replace("\x00", " ").strip()
+
+
+def _cmd_resume(args: argparse.Namespace) -> int:
+    name = (args.assignee or "").strip()
+    marker = kb.quiesce_dir() / name
+    if not marker.exists():
+        print(f"{name} is not quiesced")
+        return 0
+    marker.unlink()
+    print(f"resumed {name} — the dispatcher will spawn workers for it again")
+    return 0
+
+
+def _cmd_quiesced(args: argparse.Namespace) -> int:
+    d = kb.quiesce_dir()
+    names = sorted(p.name for p in d.iterdir()) if d.is_dir() else []
+    if getattr(args, "json", False):
+        print(json.dumps(names, indent=2))
+        return 0
+    if not names:
+        print("(nothing quiesced — all profiles in service)")
+        return 0
+    for n in names:
+        inflight = sum(1 for _ in _iter_worker_processes(n))
+        try:
+            who = (d / n).read_text().strip() or "unknown"
+        except OSError:
+            who = "unknown"
+        suffix = f"  ({inflight} worker(s) STILL RUNNING)" if inflight else ""
+        print(f"{n:20s}  {who}{suffix}")
     return 0
 
 

@@ -6788,6 +6788,38 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
 )
 
 
+def quiesce_dir() -> Path:
+    """Directory of per-assignee quiesce markers.
+
+    A plain directory of empty files rather than config or DB state, on
+    purpose: this is an emergency brake. It must be settable and clearable
+    with nothing but a shell, work when the gateway is wedged or the DB is
+    locked, survive restarts, and be inspectable with ``ls``. Anything that
+    needs the thing it is trying to stop is not a brake.
+    """
+    override = os.environ.get("HERMES_KANBAN_QUIESCE_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "quiesced"
+
+
+def assignee_is_quiesced(assignee: str) -> bool:
+    """True when the operator has taken ``assignee`` out of service.
+
+    Fails OPEN (returns False) if the marker directory cannot be read. A
+    brake that jams on when the filesystem hiccups would strand the whole
+    fleet; the failure we are guarding against is an agent running when it
+    should not, and that one is visible and recoverable.
+    """
+    name = (assignee or "").strip()
+    if not name or "/" in name or name in (".", ".."):
+        return False
+    try:
+        return (quiesce_dir() / name).exists()
+    except OSError:
+        return False
+
+
 @dataclass
 class DispatchResult:
     """Outcome of a single ``dispatch`` pass."""
@@ -6820,6 +6852,18 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_quiesced: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks not spawned because their assignee is quiesced — the operator
+    has taken that profile out of service. Each entry is
+    ``(task_id, assignee)``. NOT a failure and NOT a routing problem: the
+    work stays ready and resumes the moment the profile is un-quiesced.
+
+    Exists because stopping a profile's own gateway does not stop its work.
+    The dispatcher runs inside the ORCHESTRATOR's gateway and spawns
+    ``hermes -p <assignee>`` as its own child, so those workers live in the
+    orchestrator's cgroup and survive ``systemctl stop`` of the unit named
+    after them. An operator who stops a misbehaving profile watches it keep
+    claiming tasks while systemd reports the unit inactive."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -8483,6 +8527,12 @@ def _dispatch_once_locked(
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
             continue
+        # Operator has this profile out of service. Checked before the
+        # concurrency cap and before the respawn guard: quiesce is a
+        # deliberate human decision and outranks every scheduling heuristic.
+        if assignee_is_quiesced(row_assignee):
+            result.skipped_quiesced.append((row["id"], row_assignee))
+            continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
@@ -8616,6 +8666,9 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        if assignee_is_quiesced(row["assignee"]):
+            result.skipped_quiesced.append((row["id"], row["assignee"]))
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
